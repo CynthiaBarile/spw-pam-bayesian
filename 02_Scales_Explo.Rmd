@@ -1,0 +1,215 @@
+---
+title: 'Scale selection'
+author: "Cynthia Barile"
+output:
+  html_document:
+    theme: journal
+    highlight: breezedark
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: 
+      collapsed: false # to prevent collapsing down smaller headers
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+bibliography: "C:/Users/cynth/Google Drive/PhD/BibTeX/PhD_papers.bib"
+link-citations: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE)
+
+## The lines below are to modify the style of the document, in particular here to extend the margins in the HTML
+```
+
+<style type="text/css">
+.main-container {
+  max-width: 1800px !important;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+
+```{r packages}
+# Set wd to the folder containing this script
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path)) 
+
+library(dplyr)
+library(ggplot2)
+library(scales) # pretty_breaks function for ggplot
+library(sf) # to drop geometry because I forgot before
+```
+
+Let's load the final dataset - `SPW_PAM_data_allcovariates.rds` - generated in the `01_DataPreparation.Rmd` script.
+
+A couple things will be done here: 1) remove a useless column I forgot to remove, 2) drop the geometry.  
+
+In @Pirotta2020, all data is standardised to "facilitate model convergence". I tried to do that but then actually realised it was not changing anything at all (results were also the same). So I decided not to standardise, as it was a pain afterwards to back-transform for the partial plots (if not back-transformed, impossible for interpretation).
+
+```{r data}
+data <- readRDS("../01_Data/SPW_PAM_allcovariates.rds")
+# And drop the geometry, I forgot to do that
+data <- cbind(st_coordinates(data), as.data.frame(st_drop_geometry(data)))
+
+# not doing that anymore (standardisation)
+#data.standard <- data # duplicate the data so structure is already there for loop
+#for (col.id in 8:ncol(data.standard)){ # iterate starting from column 8
+#  for (row.id in 1:nrow(data.standard)) { # iterate over rows
+# Loi centrée réduite: (x - mean) / sd    
+#    data.standard[row.id, col.id] <- (data[row.id,col.id] - mean(data[,col.id])) /
+#                                      sd(data[,col.id])
+#  }
+#}
+```
+
+# Scale selection
+
+All environmental variables of interest have been accessed at different spatio-temporal scales. Because of the evident collinearity that will exist across the different scales of a single variable, each variable's most representative scale must be selected before any modelling can be carried out. 
+
+The scale selection methodology used in the previous chapter was based on the QIC scores, following an implementation of the models with a `GEE-GLM` framework. In this chapter, BARTs will be used. But BART does not have any implemented method to compare scales in such a way, as it needs a minimum of 3 covariates to run a model. So the same methodology will be used here.  
+
+However, a quick check was run, comparing the results of a selection using both `GEE-GLM` and `GLM` frameworks. The results were the same. So a simple `GLM` framework will be used here.
+
+```{r AIC computation}
+# create vector containing variables names (variables start at column 8)
+var.names <- colnames(data)[8:ncol(data)] 
+
+aic.fun <- function(x){ # where x will be the name of the columns
+  aic <- AIC(glm(PA ~ data[[x]], family = binomial, data = data))
+  return(aic)
+  }
+scores <- unlist(lapply(var.names, aic.fun)) # apply function with all variables
+scores <- data.frame(scores, row.names = var.names) # turn into a df
+print(scores)
+```
+
+All those AIC scores need to be compared, variable per variable, with the score of an empty model:
+
+```{r AICempty}
+AIC(glm(PA ~ 1, family = binomial, data = data))
+```
+
+**Final scale selection**  
+The scale yielding an AIC score lower than the others by at least 2 units should be selected. If so, comments below state "AIC-based". If the delta AIC < 2, the decision is arbitrary. In that case, the comments state "arbitrary".
+
+**/!\ WARNING**: I forgot to remove the scales of 0.5 arc-min for the static variables. But I can't use those, because it corresponds to a resolution of 1 km, which is lower than that of my response variable (4 km segments).  
+Reason for this: "Relationships between detections and environmental conditions could be concealed if detection ranges exceed the scale of analysis" - @Silva2019  
+
+* **Depth**: `depth2.5` - arbitrary   
+* **Slope**: `slope2.5` - AIC-based  
+* **Northness**: `northness10` - AIC-based  
+* **Eastness**: `eastness10` - arbitrary, taking the same as for northness
+* **Rugosity**: `rugosity2.5` - AIC-based  
+* **TPI**: `tpi10` - AIC-based  
+* **Chla**: `chla4km` - arbitrary  
+* **Distance to front**: `distfront7km` - arbitrary  
+* **Front strength**: `frontstrength7km` - arbitrary  
+* **SST**: I'm kicking the SST out for several reasons: (1) the AIC of the empty model is actually lower. (2) having absolute SST is not a good idea considering how it behaved throughout the surveys, with very different ranges of values in May surveys. (3) better in general to reflect relative changes in the environment. (4) when I kick it out, the model keeps the relSST, which is more meaningful as well. (5) it was creating a lot of collinearity problems down the line.
+* **Deviation of SST**: `dev.sst4km` - arbitrary  
+* **sdSST**: `sd.monthsst20km` - AIC-based   
+* **relSST**: `relsst.month4km` - AIC-based for the temporal part, but then across spatial scales the decision was arbitrary.
+
+```{r update datatable}
+# selected scales
+select <- c("depth2.5", "slope2.5", "northness10", "eastness10", "rugosity2.5", "tpi10", "chla4km", 
+            "distfront7km", "frontstrength7km", "dev.sst4km", 
+            "sd.monthsst20km", "relsst.month4km", "SLA", "Year", "Season")
+# bind columns 1:7 (which are not covariate data) and the selected covariates
+modeldata <- cbind(data[,1:7], data[,select])
+```
+
+# Collinearity checks
+
+Now that a single scale has been retained for each variable, collinearity among explanatory variables must be assessed. This is done with both *pairwise correlation plots* (threshold at 0.6) and the *variance inflation factor* (VIF - threshold at 3).
+
+```{r}
+var.names <- colnames(modeldata)[7:ncol(modeldata)] # variables
+## Function needs a df containing only the predictors
+variables <- data.frame(modeldata[,c(var.names)]) 
+
+vif.model <- lm(PA ~., data=variables) # create a linear model
+vifs <- car::vif(vif.model) # run the VIF function
+
+# put in bold vifs values higher than 3
+vifs[which(vifs > 3)] <- kableExtra::cell_spec(vifs[which(vifs > 3)], bold = TRUE)
+# and print a table
+knitr::kable(vifs, format = "markdown", align = "l", escape =FALSE)
+```
+
+Check the results from a pairwise correlation approach:
+
+```{r}
+library(corrplot)
+
+# factors need to be numerical for the corrplot to run
+variables$Year <- as.numeric(variables$Year)
+variables$Season <- as.numeric(variables$Season)
+
+corrplot.mixed(cor(variables[-1]),
+               lower = "number", 
+               upper = "shade",
+               upper.col = COL2("RdBu", 200),
+               tl.pos = "lt", tl.col = "black", tl.cex = 0.7, tl.srt = 45,
+               number.cex = 0.7,
+               diag = "u")
+```
+
+Conclusions here: very high correlation of 1 between `slope2.5` and `rugosity2.5`. High correlation as well between `Season` and `chla4km` (0.80), between `Season` and `SLA` (0.65). Also correlation between `Year` and `relsst.month4km` (0.81). 
+
+`rugosity2.5` is excluded from subsequent analyses. `slope2.5` is preferred simply because it is a more common metric, which makes it more easily interpretable and understandable. I am also discarding `Season` and `Year`, as I prefer to keep indicators of environmental conditions. `Season` causes problems with 2 variables as well actually, so the decision here is obvious. 
+
+After discarding those variables, I re-run the VIF just to check if there's still any collinearity issue. 
+
+```{r reupdate datatable}
+# selected scales
+select <- c("depth2.5", "slope2.5", "northness10", "eastness10", "tpi10", "chla4km", 
+            "distfront7km", "frontstrength7km", "dev.sst4km", 
+            "sd.monthsst20km", "relsst.month4km", "SLA")
+# bind columns 1:7 (which are not covariate data) and the selected covariates
+modeldata <- cbind(data[,1:7], data[,select])
+
+var.names <- colnames(modeldata)[7:ncol(modeldata)] # variables
+## Function needs a df containing only the predictors
+variables <- data.frame(modeldata[,c(var.names)]) 
+
+vif.model <- lm(PA ~., data=variables)
+vifs <- car::vif(vif.model)
+
+vifs[which(vifs > 3)] <- kableExtra::cell_spec(vifs[which(vifs > 3)], bold = TRUE)
+knitr::kable(vifs, format = "markdown", align = "l", escape =FALSE)
+```
+
+No problem anymore.
+
+# Data explo
+
+Check for NAs quickly:
+```{r}
+sum(is.na(variables))
+```
+
+There are no NAs in the data. There were some in `chla4km` actually, but those have already been filled in the previous Markdown, by interpolation. 
+
+Covariate data now needs to be checked for outliers.  
+
+```{r outliers, results='hide', fig.keep='all', out.width="80%"}
+covariates <- variables[-1]
+
+par(mfrow = c(4,3), mar = c(2, 2, 1.1, 1), oma=c(0,0,0,0))
+sapply(names(covariates), function(x) boxplot(covariates[[x]], main = x))
+```
+
+Nothing aberrant here, even when it's a bit spread it's still possible values. So I'm not going to do anything here.
+
+# Final dataset
+
+Let's export the final data table, ready for modelling.
+
+```{r export data}
+names(modeldata)[c(1,2)] <- c("Long", "Lat") # rename X and Y
+
+# export final object
+saveRDS(modeldata, "../01_Data/data_model.rds")
+```
+

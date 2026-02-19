@@ -1,0 +1,875 @@
+---
+title: 'BART models for SPW using PAM'
+author: "Cynthia Barile"
+output:
+  html_document:
+    theme: journal
+    highlight: breezedark
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: 
+      collapsed: false # to prevent collapsing down smaller headers
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+bibliography: "C:/Users/cynth/Google Drive/PhD/BibTeX/PhD_papers.bib"
+link-citations: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE)
+
+## The lines below are to modify the style of the document, in particular here to extend the margins in the HTML
+```
+
+<style type="text/css">
+.main-container {
+  max-width: 1800px !important;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+```{r packages, message=FALSE, warning=FALSE}
+# Set wd to the folder containing this script
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path)) 
+
+# devtools::install_github("rvalavi/blockCV", dependencies = TRUE)
+library(fuzzySim)
+library(sp)
+library(sf)
+library(tmap)
+library(raster)
+library(blockCV)
+library(terra)
+library(embarcadero)
+library(cartography)
+library(RColorBrewer)
+library(modEvA)
+library(marmap)
+```
+
+Let's load the `data_modelling.rds` object created at the end of the previous Markdown `02_Scale_Explo.rmd`. It will be renamed `data`.
+
+```{r model data}
+data <- readRDS("../01_Data/data_model.rds")
+```
+
+# Variable selection
+
+The first step is the variable selection. The `embarcadero` package has built-in function to automate the process with BART, the `variable.step` function. 
+
+```{r}
+names(data)
+pa_col <- 7 # presence/absence is in this column IN THIS DATASET
+var_cols <- 8:ncol(data)  # variables are in these columns IN THIS DATASET (change as appropriate!)
+names(data)[pa_col]  # check that it's OK
+names(data)[var_cols]  # check that it's OK
+```
+
+```{r varselect, results='hide', fig.keep='all', message=FALSE, warning=FALSE, eval=FALSE}
+varselect_BART <- variable.step(x.data = data[ , var_cols], y.data = data[ , pa_col],
+                                iter = 100)
+# save the result because I don't want to run this line every time
+```
+
+The following variables were retained: `depth2.5`, `slope2.5`, `northness10`, `eastness10`, `chla4km`, `distfront7km`, `frontstrength7km`, `relsst.month4km` and `SLA`.  
+Let's update the data table to keep only the relevant predictors:  
+
+```{r datacleaning}
+varselect_BART <- c("depth2.5", "slope2.5", "northness10", "eastness10", "chla4km", "distfront7km", "frontstrength7km", "relsst.month4km", "SLA")  
+data <- cbind(data[,c(1:7)], data[,varselect_BART])
+```
+
+# Modelling
+
+Before we start, let's create objects grouping what will be necessary:
+```{r prepa, message=FALSE, warning=FALSE}
+coord_cols <- 1:2 # coordinates columns
+sp_col <- 7 # presence absence column
+var_cols <- c(8:ncol(data)) # environmental variables
+names(data)[coord_cols]
+names(data)[sp_col]
+names(data)[var_cols]
+```
+
+We now need to divide the area for a 10-fold cross-validation. Spatial blocks folds are created using the `blockCV` package. Those folds are then added to the data table to assign rows to folds.
+
+```{r blocks division, results='hide', fig.keep='all',}
+dat_spatial <- vect(data, 
+      geom = c("Long", "Lat"), 
+      crs = "+proj=utm +zone=29 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+plot(dat_spatial)
+
+set.seed(777)
+blocks <- spatialBlock(speciesData = as(dat_spatial, "Spatial"), species = NULL, 
+                       rasterLayer = NULL, theRange = 70000, k = 10L,
+                       selection = "systematic", iteration = 100L, numLimit = 0L,
+                       showBlocks = TRUE, biomod2Format = TRUE, xOffset = 0,
+                       yOffset = 0, progress = TRUE, verbose = TRUE)
+
+# add folds to the data table:
+data$cvfolds <- blocks$foldID
+plot(data[ , c("Long", "Lat")], col = data$cvfolds)  # each fold gets a different colour
+
+folds <- sort(unique(data$cvfolds))
+```
+
+We also need to run the model with all data (no folding here) and get the importance of each variable in the model. Then we change the order in which the variables are fed in the model based on this. We also run the predictions based on all data and append the results to the `preds_cv` data table again.
+
+```{r bart all}
+mod_bart <- bart(y.train = data[ , sp_col],
+                 x.train = data[, var_cols],
+                 keeptrees = TRUE, verbose = FALSE)
+invisible(mod_bart$fit$state)
+```
+
+Get the variables importance:
+
+```{r varimp}
+var_contribs <- varimp(mod_bart, plots = TRUE)[, "varimps"]
+names(var_contribs) <- varselect_BART
+print(var_contribs)
+```
+
+We need to put the variables in the model in their order of importance and re-run the model:
+
+```{r modbart_final}
+var_cols <- c(9, 11, 13, 10, 16, 14, 8, 15, 12) # change the order
+names(data[var_cols]) # double check
+
+mod_bart_final <- bart(y.train = data[ , sp_col],
+                  x.train = data[, var_cols],
+                  keeptrees = TRUE, verbose = FALSE)
+invisible(mod_bart_final$fit$state)
+```
+
+The next step consists of running models with BART on each fold. A data table `preds_cv` is created to store all the predictions on each fold.
+
+```{r bart folds, results='hide'}
+# Function to run predictions with data frames instead of raster objects
+source("https://raw.githubusercontent.com/AMBarbosa/unpackaged/master/predict_bart_df")
+
+# Create data frame to store predictions
+nrow(data) # 1871
+preds_cv <- data.frame(data[ , c("Long", "Lat", "SampleLabel", "PA", "cvfolds")])
+nrow(preds_cv) # 1871
+
+# Loop over the folds, compute model, get predictions
+for(f in folds) {
+  cat("modelling outside fold", f, "...\n") # inform progress
+# at each fold f, keep data with cvfolds = f for testing and the rest for training
+  dat_train <- subset(data, cvfolds != f)
+
+# run the model, leaving out each fold in turn
+  mod_bart <- bart(y.train = dat_train[ , sp_col], 
+                   x.train = dat_train[ , var_cols],
+                   keeptrees = TRUE, verbose = FALSE)
+  
+  
+# calculate and add predictions to the preds_cv data table
+  preds_cv[ , paste0("fold_", f)] <- predict_bart_df(mod_bart, data)
+} # end for f
+
+# predictions on all data
+preds_cv[ , "alldata"] <- predict_bart_df(mod_bart_final, data)
+```
+
+# Predictions study area
+## Set base
+
+The predictions need to be mapped within certain boundaries, which need to be set beforehand. This will be needed to create the data table on which the predictions will be based.  
+First, a larger box is defined and will be the maximal extent of the maps: `area.box`.  
+Then, based on the `northbox` and `southbox` shapefiles, delimiting the survey areas of ObSERVE, a polygon in which the actual predictions will be mapped is created (`pred.zone`, in red on the plot below).  
+
+```{r pred zone, results='hide', fig.keep='all'}
+# Delimitate area to map in
+# create a box as a Spatial Object
+area.box <- as(extent(-17.00, -7.995, 48.00, 57.00), 'SpatialPolygons') 
+crs(area.box) <- "+proj=longlat +datum=WGS84 +no_defs" # define crs
+
+northbox <- st_read("F:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Shapefiles/NorthBox.shp")
+southbox <- st_read("F:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Shapefiles/SouthBox.shp")
+st_crs(northbox) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs" # define crs
+st_crs(southbox) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+northbox <- st_transform(northbox, 
+            crs ="+proj=utm +zone=29 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+southbox <- st_transform(southbox, 
+            crs ="+proj=utm +zone=29 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+
+# Merge them
+area <- st_union(northbox, southbox)
+
+# Create a polygon encompassing both zones, with a little buffer around
+pred.zone <- st_simplify(st_buffer(area, dist = 20000), dTolerance = 7000)
+
+# add the transects just to have an idea of scale there
+transects <- read_sf("../01_Data/PAM_Surveys.shp")# transect lines
+sf::st_crs(transects) <- 4326  
+transects <- st_transform(transects, 32629)
+
+# Have a look to adjust the buffer and tolerance parameters if necessary
+tm <- tm_shape(area.box) +
+  tm_borders() +
+tm_shape(pred.zone) +
+  tm_borders(col="red") +
+tm_shape(northbox) +
+  tm_borders() +
+tm_shape(southbox) +
+  tm_borders() +
+tm_shape(transects) +
+  tm_lines() +
+tm_graticules(lines = FALSE)
+print(tm)
+```
+
+Predictions estimated using the `mod_bart_final` will be mapped within this `pred.zone` polygon. `dist` parameter in the `st_buffer` function can be adjusted to extend/decrease the boundaries of the polygon.
+
+## Predictors data
+The `mod_bart_final` retained `depth2.5`, `slope2.5`, `northness10`, `eastness10`, `chla4km`, `distfront7km`, `frontstrength7km`, `relsst.month4km` and `SLA`. 
+Because all the rasters used to create the initial modelling table were not saved but values directly extracted from them, those need to be re-generated to create the prediction data... This chunk is not shown here but can be found in the `.Rmd` file if necessary. 
+
+```{r, access preds, echo=FALSE}
+# prep depth to derive the necessary static variables
+depth15sec <- readGEBCO.bathy("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Bathymetry/gebco_2021_n58.0_s46.0_w-20.0_e-5.0.nc") %>%
+  marmap::as.raster() %>% # Need to convert to a raster first
+  rast(crs = crs.ref) # and from raster to a SpatRaster (terra format)
+depth15sec[depth15sec > 0] <- NA # Remove the values for the land
+depth15sec <- project(depth15sec, "epsg:32629") # need to work on projected data
+
+# static predictors
+depth <- aggregate(depth15sec, fact = 10, fun = mean) # aggregate to 2.5 arc-min
+slope <- terrain(depth, v = "slope", neighbors = 8, unit = "degrees")
+
+depth10 <- aggregate(depth15sec, fact = 40, fun = mean) # aggregate to 10 arc-min
+aspect <- terrain(depth10, v = "aspect", neighbors = 8, unit = "radians")
+northness <- cos(aspect)
+eastness <- sin(aspect)
+
+# dynamic predictors
+# distfront
+projection <- "+proj=utm +zone=29 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
+
+distfront <- list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Ocean_fronts",
+                        pattern = "front_dist", full.names = TRUE)
+distfront.may2015 <- raster(distfront[1]) %>% projectRaster(crs = projection)
+distfront.may2016 <- raster(distfront[4]) %>% projectRaster(crs = projection)
+distfront.spring <- stack(distfront[c(1,4)]) %>% projectRaster(crs = projection) %>%
+  calc(fun=mean) # average May months
+distfront.june <- raster(distfront[5]) %>% projectRaster(crs = projection)
+distfront.august <- raster(distfront[2]) %>% projectRaster(crs = projection)
+distfront.autumn <- c(distfront[c(3,6)],
+          list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Ocean_fronts",
+                      pattern = "DISTFRONT_PREDICTIONS", full.names = TRUE)) %>%
+                    stack() %>% projectRaster(crs = projection) %>%
+                    calc(fun=mean)
+distfront.sept <- raster(distfront[3]) %>% projectRaster(crs = projection)
+distfront.oct <- raster(distfront[6]) %>% projectRaster(crs = projection)
+
+# front strength
+strength <- list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Ocean_fronts",
+                        pattern = "front_strength", full.names = TRUE)
+strength.may2015 <- raster(strength[1]) %>% projectRaster(crs = projection)
+strength.may2016 <- raster(strength[4]) %>% projectRaster(crs = projection)
+strength.spring <- stack(strength[c(1,4)]) %>% projectRaster(crs = projection) %>%
+  calc(fun=mean) # average May months
+strength.june <- raster(strength[5]) %>% projectRaster(crs = projection)
+strength.august <- raster(strength[2]) %>% projectRaster(crs = projection)
+strength.autumn <- c(strength[c(3,6)],
+          list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Ocean_fronts",
+                      pattern = "FRONTSTRENGTH_PRED", full.names = TRUE)) %>%
+                    stack() %>% projectRaster(crs = projection) %>%
+                    calc(fun=mean)
+strength.sept <- raster(strength[3]) %>% projectRaster(crs = projection)
+strength.oct <- raster(strength[6]) %>% projectRaster(crs = projection)
+
+# relSST: prepared before, so it's also already cropped
+relsst <- stack("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/SST/relSST_month_forpreds.tif")
+relsst.may2015 <- relsst[[1]] %>% projectRaster(crs = projection)
+relsst.may2016 <- relsst[[4]] %>% projectRaster(crs = projection)
+relsst.spring <- relsst[[c(1,4)]] %>% projectRaster(crs = projection) %>%
+  calc(fun=mean) # average May 2015 & 2016
+relsst.june <- relsst[[5]]  %>% projectRaster(crs = projection)
+relsst.august <- relsst[[2]] %>% projectRaster(crs = projection)
+relsst.autumn <- relsst[[c(3,6:8)]] %>% projectRaster(crs = projection) %>%
+  calc(fun=mean) # average oct, sept 2015 2016
+relsst.sept <- relsst[[3]] %>% projectRaster(crs = projection)
+relsst.oct <- relsst[[6]] %>% projectRaster(crs = projection)
+
+# chla: also prepared before so they are cropped too
+chla <- stack("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Chlorophyll/chla.preds.tif")
+chla.may2015 <- chla[[1]] %>% projectRaster(crs = projection)
+chla.may2016 <- chla[[4]] %>% projectRaster(crs = projection)
+chla.spring <- chla[[c(1,4)]] %>% projectRaster(crs = projection) %>% calc(fun=mean)
+chla.june <- chla[[5]] %>% projectRaster(crs = projection)
+chla.august <- chla[[2]] %>% projectRaster(crs = projection)
+chla.autumn <- chla[[c(3,6:8)]] %>% projectRaster(crs = projection) %>% calc(fun=mean)
+chla.sept <- chla[[3]] %>% projectRaster(crs = projection)
+chla.oct <- chla[[6]] %>% projectRaster(crs = projection)
+
+# SLA - can only access daily, so it's a lot of data to stack. 
+# Not gonna store all files, so I'm directly computing the averages in another script
+# and store only monthly average files (SLA folder, "PREDICTIONS")
+sla <- list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Sea_level_anomaly/", 
+                  pattern = "PREDICTIONS", full.names = TRUE)
+sla.may2015 <- sla[4] %>% raster() %>%
+  projectRaster(crs = projection)
+sla.may2016 <- sla[5] %>% raster() %>% 
+  projectRaster(crs = projection)
+sla.spring <- sla[3] %>% raster() %>% 
+  projectRaster(crs = projection)
+sla.june <- sla[2] %>% raster() %>% 
+  projectRaster(crs = projection)
+sla.august <- sla[1] %>% raster() %>% 
+  projectRaster(crs = projection)
+sla.autumn <- sla[7] %>% raster() %>% 
+  projectRaster(crs = projection)
+sla.sept <- sla[8] %>% raster() %>% 
+  projectRaster(crs = projection)
+sla.oct <- sla[6] %>% raster() %>% 
+  projectRaster(crs = projection)
+```
+
+For the *dynamic predictors*, one needs to select a time period for the predictions, to access the data accordingly. Predictions will be run on the following:  
+* **May (spring)**: take monthly mean of both May 2015 and 2016, averaged.  
+* **June (summer)**: take monthly mean of June 2016.  
+* **August (summer)**: take monthly mean of August 2015.  
+* **September & October (autumn)**: take monthly means of Sept & Oct 2015 and 2016, averaged.  
+
+For each dynamic predictor, 4 `Raster` objects have been created: e.g. for distance to front, `distfront.spring`, `distfront.june`, `distfront.august`, `distfront.autumn`.   
+I also added rasters for each individual month of may and sept/oct, just to double check if my final predictions are different or not than when the months are pooled.
+
+Because the predictions will be run on a grid of finer resolution, all predictors need to be re-sampled. This is done using the function `resample`. The resolution and extent to be matched is that of a created, empty raster: `dummy.raster`. 
+
+```{r resample}
+# dummy raster of reference
+# need to re-create the area without projecting, will project after setting the res
+northbox <- st_read("F:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Shapefiles/NorthBox.shp")
+southbox <- st_read("F:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Shapefiles/SouthBox.shp")
+st_crs(northbox) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs" # define crs
+st_crs(southbox) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+area <- st_union(northbox, southbox)
+pred.zone <- st_simplify(st_buffer(area, dist = 20000), dTolerance = 7000)
+
+# create a raster of that extent and set the resolution in degrees
+dummy.rast <- raster(extent(pred.zone), 
+                     res=0.01, 
+                     crs = "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs") 
+# now project 
+dummy.rast <- projectRaster(dummy.rast, crs = projection)
+
+# store all predictors, in the order of var importance in the model
+preds <- list(slope, eastness, 
+              distfront.may2015, distfront.may2016, distfront.spring, distfront.june, 
+              distfront.august, distfront.autumn, distfront.sept, distfront.oct,
+              northness, 
+              sla.may2015, sla.may2016, sla.spring, sla.june, sla.august, 
+              sla.autumn, sla.sept, sla.oct,
+              strength.may2015, strength.may2016, strength.spring, strength.june, 
+              strength.august, strength.autumn, strength.sept, strength.oct,
+              depth, 
+              relsst.may2015, relsst.may2016, relsst.spring, relsst.june, 
+              relsst.august, relsst.autumn, relsst.sept, relsst.oct, 
+              chla.may2015, chla.may2016, chla.spring, chla.june, chla.august, 
+              chla.autumn, chla.sept, chla.oct)
+names(preds) <- c("slope", "eastness", 
+              "distfront.may2015", "distfront.may2016", "distfront.spring", "distfront.june", 
+              "distfront.august", "distfront.autumn", "distfront.sept", "distfront.oct",
+              "northness", 
+              "sla.may2015", "sla.may2016", "sla.spring", "sla.june", "sla.august", 
+              "sla.autumn", "sla.sept", "sla.oct",
+              "strength.may2015", "strength.may2016", "strength.spring", "strength.june", 
+              "strength.august", "strength.autumn", "strength.sept", "strength.oct",
+              "depth", 
+              "relsst.may2015", "relsst.may2016", "relsst.spring", "relsst.june", 
+              "relsst.august", "relsst.autumn", "relsst.sept", "relsst.oct", 
+              "chla.may2015", "chla.may2016", "chla.spring", "chla.june", "chla.august", 
+              "chla.autumn", "chla.sept", "chla.oct")
+
+# resample
+for (i in 1:length(preds)){
+  
+  if(class(preds[[i]]) == class(slope)){
+    preds[[i]] <- raster(preds[[i]])
+  } else {NA}
+  
+  preds[[i]] <- resample(preds[[i]], dummy.rast)
+}
+```
+
+The second step is now to mask and crop the raster layers of interest to the limits of the `pred.zone` polygon. 
+
+```{r mask preds, results='hide', fig.keep='all', out.width="80%"}
+preds.crop <- preds
+pred.zone.pro <- st_transform(pred.zone, 
+            crs ="+proj=utm +zone=29 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+# Pipe operator: take `object` -> mask -> crop
+for (i in 1:length(preds.crop)){
+  preds.crop[[i]] <- preds.crop[[i]] %>% mask(mask = pred.zone.pro) %>% 
+    crop(y = extent(pred.zone.pro))
+}
+```
+
+Let's just have a look at all the variables for one of the prediction time windows (spring):
+
+```{r plot relsst chla, results='hide', fig.keep='all', echo=FALSE, out.width="80%"}
+par(mfrow = c(3,3), mar=c(2,3,1,3), oma=c(0,0,0,0))
+plot(preds.crop$depth, main = "Depth")
+plot(preds.crop$slope, main = "Slope")
+plot(preds.crop$eastness, main = "Eastness")
+plot(preds.crop$northness, main = "Northness")
+plot(preds.crop$distfront.spring, main = "DistFront.Spring", zlim = c(0,32))
+plot(preds.crop$sla.spring, main = "SLA.Spring", zlim = c(-0.2,0.2))
+plot(preds.crop$relsst.spring, main = "Relsst.Spring", zlim = c(-2,3))
+plot(preds.crop$chla.spring, main = "Chla.Spring", zlim = c(0,3))
+plot(preds.crop$strength.spring, main = "Front strength Spring")
+```
+
+Let's create different stacks of those predictors: one per prediction period.
+
+```{r preds stacks}
+# careful, put the variables in the same order than in the table for model
+preds.may2015 <- stack(preds.crop[c(1:3,11,12,20,28,29,37)]) # may 2015
+preds.may2016 <- stack(preds.crop[c(1,2,4,11,13,21,28,30,38)]) # may 2016
+preds.spring <- stack(preds.crop[c(1,2,5,11,14,22,28,31,39)]) # spring
+preds.aug2015 <- stack(preds.crop[c(1,2,7,11,16,24,28,33,41)]) # August 2015
+preds.june2016 <- stack(preds.crop[c(1,2,6,11,15,23,28,32,40)]) # June 2016
+preds.autumn <- stack(preds.crop[c(1,2,8,11,17,25,28,34,42)]) # autumn
+preds.sept <- stack(preds.crop[c(1,2,9,11,18,26,28,35,43)]) # September 2015
+preds.oct <- stack(preds.crop[c(1,2,10,11,19,27,28,36,44)]) # Oct 2016
+```
+
+The prediction raster layers are ready to be used to run predictions based on the model `mod_bart`. The predictions are run using the `predict()` function on the raster layers. Once computed, I stack them all into a RasterStack object `final_predictions`, saved on the drive.
+
+The quantiles are also computed, as they will be needed to compute the uncertainty later on.
+
+```{r prediction rasters, eval=FALSE}
+# on Spring (May months)
+# some format conversions needed because 'predict' for BART does not yet accept 
+# 'terra' package formats
+names(preds.may2015) <- names(data[var_cols])
+preds.may2015.raster <- rast(predict(mod_bart_final, x.layers = preds.may2015,
+                                     quantiles = c(0.025, 0.975)))  
+# on may 2016
+names(preds.may2016) <- names(data[var_cols])
+preds.may2016.raster <- rast(predict(mod_bart_final, x.layers = preds.may2016,
+                                     quantiles = c(0.025, 0.975)))  
+# on spring
+names(preds.spring) <- names(data[var_cols])
+pred.spring.raster <- rast(predict(mod_bart_final, x.layers = preds.spring,
+                                     quantiles = c(0.025, 0.975)))  
+# On June 2016
+names(preds.june2016) <- names(data[var_cols])
+pred.june.raster <- rast(predict(mod_bart_final, x.layers = preds.june2016,
+                                     quantiles = c(0.025, 0.975))) 
+# On August 2016
+names(preds.aug2015) <-  names(data[var_cols])
+pred.aug.raster <- rast(predict(mod_bart_final, x.layers = preds.aug2015,
+                                     quantiles = c(0.025, 0.975)))  
+# on september 2015
+names(preds.sept) <-  names(data[var_cols])
+pred.sept.raster <- rast(predict(mod_bart_final, x.layers = preds.sept,
+                                     quantiles = c(0.025, 0.975)))  
+# on october 2016
+names(preds.oct) <- names(data[var_cols])
+pred.oct.raster <- rast(predict(mod_bart_final, x.layers = preds.oct,
+                                     quantiles = c(0.025, 0.975)))
+# On Autumn (Sept-Oct months)
+names(preds.autumn) <-  names(data[var_cols])
+pred.autumn.raster <- rast(predict(mod_bart_final, x.layers = preds.autumn,
+                                     quantiles = c(0.025, 0.975)))  
+
+# stack and back up
+final.predictions.rast <- c(preds.may2015.raster, preds.may2016.raster, 
+                          pred.spring.raster, pred.june.raster, pred.aug.raster,
+                          pred.sept.raster, pred.oct.raster, pred.autumn.raster)
+names(final.predictions.rast) <- c("may2015", "may2015.q1", "may2015.q2",
+                                   "may2016", "may2016.q1", "may2016.q2",
+                                   "spring", "spring.q1", "spring.q2", 
+                                   "june", "june.q1", "june.q2", 
+                                   "august", "august.q1", "august.q2",
+                                   "september", "september.q1", "september.q2",
+                                   "october", "october.q1", "october.q2", 
+                                   "autumn", "autumn.q1", "autumn.q2")
+writeRaster(final.predictions.rast, "F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/final_predictions.tif", overwrite=T)
+```
+
+I want to save those predictions in a data table format as well. This is called `final.predictions.df` and backed up to the drive:
+
+```{r save preds, results='hide', eval = FALSE}
+# table of preds
+final.predictions.df <- as.data.frame(final.predictions.rast, xy = TRUE) # create df
+colnames(final.predictions.df)[1:2] <- c("long", "lat")
+
+saveRDS(final.predictions.df, file = "../01_Data/final_predictions_df.rds")
+saveRDS(preds_cv, file = "../01_Data/preds_crossval.rds") # save also the crossval
+```
+
+Let's visualise those predictions:
+
+```{r plot predictions, results='hide', fig.keep='all', out.width="80%"}
+# reload the prediction objects
+final.predictions.rast <- rast("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/final_predictions.tif")
+
+# set up colour palet for plotting predictions
+my_palette <- colorRampPalette(c("#264653", "#86c9dd", "#e5b761", "#efd199"))
+
+par(mfrow = c(2,2), mar = c(0,0,1,0), oma = c(0,0,0,0))
+plot(final.predictions.rast$spring, col = my_palette(100), range=c(0,1))
+plot(final.predictions.rast$june, col = my_palette(100), range=c(0,1))
+plot(final.predictions.rast$august, col = my_palette(100), range=c(0,1))
+plot(final.predictions.rast$autumn, col = my_palette(100), range=c(0,1))
+```
+
+# Uncertainty {.tabset}
+
+Here we generate the uncertainty associated with the predictions, which corresponds to: **Upper 95% CI bound - Lower 95% CI bound**.  
+For each time period, let's plot the predictions, lower CI, upper CI and the uncertainty. 
+
+## Spring {-}
+
+```{r uncertainty spring, results='hide', fig.keep='all', out.width="80%"}
+par(mfrow = c(2,2), mar = c(0,0,1,0), oma = c(0,0,0,0))
+plot(final.predictions.rast$spring.q1, range = c(0,1),
+     col = my_palette(100), main = 'Lower 95% CI bound')
+plot(final.predictions.rast$spring.q2, range = c(0,1),
+     col = my_palette(100), main = 'Upper 95% CI bound')
+plot(final.predictions.rast$spring, range = c(0,1),
+     col = my_palette(100), main = 'Predicted')
+plot(final.predictions.rast$spring.q2 - final.predictions.rast$spring.q1,
+     range = c(0,1), col = my_palette(100), main = 'Uncertainty')
+```
+
+In addition, we also want to plot the predicted values with the credible intervals:
+
+```{r pred CI spring, results='hide', fig.keep='last', out.width="80%"}
+final.predictions.df <- readRDS("C:/Users/cynth/Desktop/WhaleOfAHub/Sperm_Whale_PAM/01_Data/final_predictions_df.rds")
+
+bart_pred_sorted <- final.predictions.df[order(final.predictions.df$spring), ]
+par(mfrow = c(1, 1), mar = c(4, 4, 2, 1))
+plot(bart_pred_sorted$spring, pch = ".", main = "Spring")
+points(bart_pred_sorted$spring.q1, pch = ".", col = "darkgrey")
+points(bart_pred_sorted$spring.q2, pch = ".", col = "darkgrey")
+```
+
+And now, we want to plot the predicted values against the uncertainty, to see which parts of the prediction range have higher and lower associated uncertainty:
+
+```{r plot uncertainty spring, results='hide', fig.keep='all', out.width="80%"}
+plot(x = final.predictions.df$spring, 
+     y = (final.predictions.df$spring.q2 - final.predictions.df$spring.q1), 
+     pch = 20, main = "Spring")
+```
+
+## June 2016 {-}
+
+```{r uncertainty june, results='hide', fig.keep='all', out.width="80%"}
+par(mfrow = c(2,2), mar = c(0,0,1,0), oma = c(0,0,0,0))
+plot(final.predictions.rast$june.q1, range = c(0,1),
+     col = my_palette(100), main = 'Lower 95% CI bound')
+plot(final.predictions.rast$june.q2, range = c(0,1),
+     col = my_palette(100), main = 'Upper 95% CI bound')
+plot(final.predictions.rast$june, range = c(0,1),
+     col = my_palette(100), main = 'Predicted')
+plot(final.predictions.rast$june.q2 - final.predictions.rast$june.q1,
+     range = c(0,1), col = my_palette(100), main = 'Uncertainty')
+```
+
+Predicted values with credible intervals:
+
+```{r pred CI june, results='hide', fig.keep='last', out.width="80%"}
+bart_pred_sorted <- final.predictions.df[order(final.predictions.df$june), ]
+par(mfrow = c(1, 1), mar = c(4, 4, 2, 1))
+plot(bart_pred_sorted$june, pch = ".", main = "June")
+points(bart_pred_sorted$june.q1, pch = ".", col = "darkgrey")
+points(bart_pred_sorted$june.q2, pch = ".", col = "darkgrey")
+```
+
+Plot predicted values against uncertainty, to see which parts of the prediction range have higher and lower associated uncertainty:
+
+```{r plot uncertainty june, results='hide', fig.keep='all', out.width="80%"}
+plot(x = final.predictions.df$june, 
+     y = (final.predictions.df$june.q2 - final.predictions.df$june.q1), 
+     pch = 20, main = "June")
+```
+
+## August 2015 {-}
+
+```{r uncertainty august, results='hide', fig.keep='all', out.width="80%"}
+par(mfrow = c(2,2), mar = c(0,0,1,0), oma = c(0,0,0,0))
+plot(final.predictions.rast$august.q1, range = c(0,1),
+     col = my_palette(100), main = 'Lower 95% CI bound')
+plot(final.predictions.rast$august.q2, range = c(0,1),
+     col = my_palette(100), main = 'Upper 95% CI bound')
+plot(final.predictions.rast$august, range = c(0,1),
+     col = my_palette(100), main = 'Predicted')
+plot(final.predictions.rast$august.q2 - final.predictions.rast$august.q1,
+     range = c(0,1), col = my_palette(100), main = 'Uncertainty')
+```
+
+Predicted values with credible intervals:
+
+```{r pred CI august, results='hide', fig.keep='last', out.width="80%"}
+bart_pred_sorted <- final.predictions.df[order(final.predictions.df$august), ]
+par(mfrow = c(1, 1), mar = c(4, 4, 2, 1))
+plot(bart_pred_sorted$august, pch = ".", main = "August")
+points(bart_pred_sorted$august.q1, pch = ".", col = "darkgrey")
+points(bart_pred_sorted$august.q2, pch = ".", col = "darkgrey")
+```
+
+Plot predicted values against uncertainty, to see which parts of the prediction range have higher and lower associated uncertainty:
+
+```{r plot uncertainty august, results='hide', fig.keep='all', out.width="80%"}
+plot(x = final.predictions.df$august, 
+     y = (final.predictions.df$august.q2 - final.predictions.df$august.q1), 
+     pch = 20, main = "August")
+```
+
+## Autumn {-}
+
+```{r uncertainty autumn, results='hide', fig.keep='all', out.width="80%"}
+par(mfrow = c(2,2), mar = c(0,0,1,0), oma = c(0,0,0,0))
+plot(final.predictions.rast$autumn.q1, range = c(0,1),
+     col = my_palette(100), main = 'Lower 95% CI bound')
+plot(final.predictions.rast$autumn.q2, range = c(0,1),
+     col = my_palette(100), main = 'Upper 95% CI bound')
+plot(final.predictions.rast$autumn, range = c(0,1),
+     col = my_palette(100), main = 'Predicted')
+plot(final.predictions.rast$autumn.q2 - final.predictions.rast$autumn.q1,
+     range = c(0,1), col = my_palette(100), main = 'Uncertainty')
+```
+
+Predicted values with credible intervals:
+
+```{r pred CI autumn, results='hide', fig.keep='last', out.width="80%"}
+bart_pred_sorted <- final.predictions.df[order(final.predictions.df$autumn), ]
+par(mfrow = c(1, 1), mar = c(4, 4, 2, 1))
+plot(bart_pred_sorted$autumn, pch = ".", main = "Autumn")
+points(bart_pred_sorted$autumn.q1, pch = ".", col = "darkgrey")
+points(bart_pred_sorted$autumn.q2, pch = ".", col = "darkgrey")
+```
+
+Plot predicted values against uncertainty, to see which parts of the prediction range have higher and lower associated uncertainty:
+
+```{r plot uncertainty autumn, results='hide', fig.keep='all', out.width="80%"}
+plot(x = final.predictions.df$autumn, 
+     y = (final.predictions.df$autumn.q2 - final.predictions.df$autumn.q1), 
+     pch = 20, main = "Autumn")
+```
+
+## {-}
+
+# Favourability
+
+We now turn the probabilities into favourability, "a function of presence probability and the presence-absence ratio of the species in the modelled sample. This removes the effect of species prevalence on predicted values, thus making predictions commensurable and directly comparable across species and time periods" (@Baquero2021).
+
+```{r favourability, eval = FALSE}
+preds_cv[, "fav"] <- fuzzySim::Fav(obs = preds_cv[, "PA"], 
+                                   pred = preds_cv[, "alldata"])
+
+# on actual predictions
+for (i in 3:ncol(final.predictions.df)) { # preds columns
+  final.predictions.df[, paste0("fav_", colnames(final.predictions.df)[i])] <- 
+    fuzzySim::Fav(pred = final.predictions.df[, i], 
+                  sample.preval = prevalence(model = mod_bart_final))
+}
+# update the previously saved preds objects
+saveRDS(preds_cv, file = "../01_Data/preds_crossval.rds")
+saveRDS(final.predictions.df, file = "../01_Data/final_predictions_df.rds")
+
+
+# do the same but on the rasters, to have rasters of favourability directly
+favourability.raster <- final.predictions.rast # duplicate to keep structure
+for (period in 1:nlyr(favourability.raster)){
+  favourability.raster[[period]] <- 
+    fuzzySim::Fav(pred = final.predictions.rast[[period]],
+                  sample.preval = prevalence(model = mod_bart_final))
+}
+writeRaster(favourability.raster, 
+    "F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/final_pred_favourability.tif")
+```
+
+Map those favourability predictions:
+
+```{r map favourability, results='hide', fig.keep='all', out.width="80%"}
+favourability.raster <- 
+  rast("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/final_pred_favourability.tif")
+
+par(mfrow = c(2,2), mar = c(0,0,1,0), oma = c(0,0,0,0))
+plot(favourability.raster$spring, range = c(0,1),
+     col = my_palette(100), main = 'Spring')
+plot(favourability.raster$june, range = c(0,1),
+     col = my_palette(100), main = 'June 2016')
+plot(favourability.raster$august, range = c(0,1),
+     col = my_palette(100), main = 'August 2015')
+plot(favourability.raster$autumn,
+     range = c(0,1), col = my_palette(100), main = 'Autumn')
+```
+
+
+A recap of the output Raster files and objects saved:  
+* `final.predictions.rast`: RasterStack of predictions (on proba scale). Saved as `final_predictions_tif`.  
+* `favourability.raster`: RasterStack of predictions turned into favourability. Saved on hard drive `final_pred_favourability.tif`.  
+* `final.predictions.df`: data frame of predictions and favourability. Saved on HD and in repository `final_predictions_df.rds`.  
+* `preds_cv`: data frame of cross-validation folds. Saved as `preds_crossval.rds`.  
+
+# Evaluation
+
+In this section we evaluate the performances of each modelling fold. We compute the AUC and the TSS for each fold. The values for the 3 metrics are stored in a newly created `crossval` data table and AUC plotted.
+
+```{r metrics computation, out.width="80%"}
+fold_cols <- grep("fold_", names(preds_cv)) # id columns with preds from folds
+names(preds_cv)[fold_cols] # check if ok
+measures <- c("AUC", "TSS")
+
+# create an empty table to receive the cross-validation results:
+crossval <- as.data.frame(matrix(nrow = length(fold_cols), 
+                                 ncol = length(measures)))
+colnames(crossval) <- measures
+fold_preds <- preds_cv[ , fold_cols] # columns with folds predictions
+presabs <- preds_cv[, "PA"] # PA column
+
+par(mfrow = c(5, 2), mar = c(2, 2, 1.1, 1), oma=c(0,0,0,0))
+for (f in 1:length(fold_cols)) {
+  foldname <- paste0("fold", f)
+  crossval[f, "AUC"] <- AUC(obs = presabs, pred = fold_preds[,f], 
+                                   simplif = TRUE, plot = TRUE, 
+                                   main = paste0("AUC_", foldname))
+  crossval[f, "TSS"] <- threshMeasures(obs = presabs, pred = fold_preds[,f],
+                                    thresh = "preval", measures = "TSS", 
+                                    simplif = TRUE, standardize = FALSE, main = "TSS")
+}
+print(crossval)
+```
+
+Now let's generate bar plots of those evaluation measures:
+
+```{r mean performance, out.width="80%"}
+crossval_means <- sapply(crossval, mean, na.rm = TRUE) # mean for each measure
+
+barplot(crossval_means, ylim = c(0, 1), 
+        col = 1:length(measures), las = 2)
+abline(h = 1, col = "black") # common threshold to all metrics
+abline(h = 0.7, col = "black", lty = 2) # lower threshold AUC
+abline(h = 0.4, col = "pink", lty = 2) # lower threshold TSS
+```
+
+I have not included the Miller Calibration Slope, because I read this [paper here](https://www.sciencedirect.com/science/article/pii/S0895435619303579) which explains that the slope alone should not be used as an indicator of good or bad calibration. Also, another [paper](https://www.nature.com/articles/s41598-021-96047-7) in which they used only AUC and TSS to evaluate their models. 
+
+Quickly let's visualise with boxplots the metrics spread across folds:
+
+```{r mean performance boxplots, out.width="80%"}
+par(mfrow = c(1, 2))
+boxplot(crossval$AUC, main="AUC")
+abline(h = min(crossval$AUC), col = "red")
+boxplot(crossval$TSS, main="TSS")
+abline(h = min(crossval$TSS), col = "red")
+```
+
+Across all folds, AUC values ranged from 0.87 to 0.90 (mean = 0.88) and TSS values ranged from 0.54 to 0.63 (mean = 0.58).  
+The performance threshold for **AUC was set to 0.7**, delimiting poor predictions (@Swets1988). Given that "AUC can range from 0 to 1 and TSS from -1 to 1, the proportional performance threshold for **TSS was set to 0.4**" (@Baquero2021).  
+Considering this, **the model met the thresholds for both evaluation metrics on all folds**.
+
+
+# Partial plots
+
+Let's get onto the **partial dependence plots**. To make those nicer, I have adapted the initial function `partial` from `embarcadero`. I didn't want to bother adding arguments to make it more automated... So there is one function for each variable.  
+The functions are stored in `Partialplots_fun.R`.
+
+
+```{r partial plots, results='hide'}
+source("Partialplots_fun.R") # load functions
+
+northerness.pp <- northerness.partial(mod_bart_final, x.vars = "northness10", ciwidth = 0.95, trace=FALSE)
+easterness.pp <- easterness.partial(mod_bart_final, x.vars = "eastness10", ciwidth = 0.95, trace=FALSE)
+distfront.pp <- distfront.partial(mod_bart_final, x.vars = "distfront7km", ciwidth = 0.95, trace=FALSE)
+frontstrength.pp <- frontstrength.partial(mod_bart_final, x.vars = "frontstrength7km", ciwidth = 0.95, trace=FALSE)
+sla.pp <- sla.partial(mod_bart_final, x.vars = "SLA", ciwidth = 0.95, trace=FALSE)
+relsst.pp <- relsst.partial(mod_bart_final, x.vars = "relsst.month4km", ciwidth = 0.95, trace=FALSE)
+slope.pp <- slope.partial(mod_bart_final, x.vars = "slope2.5", ciwidth = 0.95, trace=FALSE)
+depth.pp <- depth.partial(mod_bart_final, x.vars = "depth2.5", ciwidth = 0.95, trace=FALSE)
+chla.pp <- chla.partial(mod_bart_final, x.vars = "chla4km", ciwidth = 0.95, trace=FALSE)
+
+cowplot::plot_grid(slope.pp[[1]], easterness.pp[[1]], distfront.pp[[1]], 
+                   northerness.pp[[1]], sla.pp[[1]], frontstrength.pp[[1]], 
+                   depth.pp[[1]], relsst.pp[[1]], chla.pp[[1]],
+                   nrow = 3, align = "hv")
+```
+
+Now let's look at the spatial partial dependence plots. Need to have loaded all the predictors rasters before. 
+
+We start with SST:
+
+```{r spatial sst, results='hide', eval=FALSE}
+# change names in rasters to match model's variables names
+names(preds.june2016) <- varselect_BART
+names(preds.spring) <- varselect_BART
+names(preds.autumn) <- varselect_BART
+names(preds.aug2015) <- varselect_BART
+
+# SST in spring
+spdp.sst.spring <- spartial(mod_bart, preds.spring, x.vars = varselect_BART[5])
+# SST in autumn
+spdp.sst.autumn <- spartial(mod_bart, preds.autumn, x.vars = varselect_BART[5])
+# SST june
+spdp.sst.june <- spartial(mod_bart, preds.june2016, x.vars = varselect_BART[5])
+# SST august
+spdp.sst.august <- spartial(mod_bart, preds.aug2015, x.vars = varselect_BART[5])
+
+par(mfrow = c(2, 2), mar = c(0, 0, 1, 0))
+plot(spdp.sst.spring)
+plot(spdp.sst.june)
+plot(spdp.sst.august)
+plot(spdp.sst.autumn)
+```
+
+For static variables, the importance remains the same as they are static, so I plot only one.
+Move to aspect:
+
+```{r spatial aspect, results='hide', eval=FALSE}
+spdp.aspect.spring <- spartial(mod_bart, preds.spring, x.vars = varselect_BART[2])
+
+plot(spdp.aspect.spring)
+```
+
+Move to distance to front:
+
+```{r spatial distfront, results='hide', eval=FALSE}
+spdp.front.spring <- spartial(mod_bart, preds.spring, x.vars = varselect_BART[4])
+spdp.front.autumn <- spartial(mod_bart, preds.autumn, x.vars = varselect_BART[4])
+spdp.front.june <- spartial(mod_bart, preds.june2016, x.vars = varselect_BART[4])
+spdp.front.august <- spartial(mod_bart, preds.aug2015, x.vars = varselect_BART[4])
+
+par(mfrow = c(2, 2), mar = c(0, 0, 1, 0))
+plot(spdp.front.spring)
+plot(spdp.front.june)
+plot(spdp.front.august)
+plot(spdp.front.autumn)
+```
+
+Move to slope:
+
+```{r spatial slope, results='hide', eval=FALSE}
+spdp.slope.spring <- spartial(mod_bart, preds.spring, x.vars = varselect_BART[1])
+
+plot(spdp.slope.spring)
+```
+
+Move to SLA:
+
+```{r spatial SLA, results='hide', eval=FALSE}
+spdp.sla.spring <- spartial(mod_bart, preds.spring, x.vars = varselect_BART[6])
+spdp.sla.autumn <- spartial(mod_bart, preds.autumn, x.vars = varselect_BART[6])
+spdp.sla.june <- spartial(mod_bart, preds.june2016, x.vars = varselect_BART[6])
+spdp.sla.august <- spartial(mod_bart, preds.aug2015, x.vars = varselect_BART[6])
+
+par(mfrow = c(2, 2), mar = c(0, 0, 1, 0))
+plot(spdp.sla.spring)
+plot(spdp.sla.june)
+plot(spdp.sla.august)
+plot(spdp.sla.autumn)
+```
+
+```{r, eval=FALSE}
+partial_BART_2and5 <- pd2bart(mod_bart, xind = c(varselect_BART[5], varselect_BART[2]))
+```
+

@@ -1,0 +1,819 @@
+---
+title: "Figures_Ch.4"
+author: "Cynthia Barile"
+output:
+  html_document:
+    theme: journal
+    highlight: breezedark
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: 
+      collapsed: false # to prevent collapsing down smaller headers
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE)
+
+## The lines below are to modify the style of the document, in particular here to extend the margins in the HTML
+```
+
+<style type="text/css">
+.main-container {
+  max-width: 1800px !important;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+```{r packages}
+# Set wd to the folder containing this script
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+library(dplyr)
+library(embarcadero)
+library(foreign)
+library(giscoR) # to access GISCO data directly from R
+library(ggplot2)
+library(ggspatial)
+library(grid)
+library(marmap) # To open bathymetry data
+library(sf)
+library(raster)
+library(RColorBrewer)
+library(terra)
+library(tmap)
+```
+
+Figures for "Chapter 3: Modelling SPW habitat use using PAM data" are generated in this script. Only Fig. 2 is created in PowerPoint and won't be found in here. 
+
+# Fig. 1: Survey tracklines
+Here we make a map for the PhD thesis (and paper), for the sperm whale PAM modelling study. 
+First, start with the bathymetry, which is the base layer of the map:
+
+```{r PAM bathymetry, results='hide', fig.keep = 'all'}
+# BATHYMETRY RASTER
+bath <- getNOAA.bathy(lon1 = -3, lon2 = -23, 
+                      lat1 = 47, lat2 =58, resolution=1) # res in minutes
+projection <- "+proj=utm +zone=29 +datum=WGS84"
+
+# Study area box
+area.box <- as(extent(-19, -5, 48, 57), 'SpatialPolygons') # create a box as a Spatial Object
+crs(area.box) <- "+proj=longlat +datum=WGS84 +no_defs" # define the crs of this box
+box <- spTransform(area.box, CRS("+init=epsg:32629")) # project the spatial object (WGS84 UTM Z29: EPSG 32629)
+
+# Project the bathymetry raster
+r1 <- marmap::as.raster(bath) # convert to a raster layer
+r2 <- projectRaster(r1, crs=projection) # project it
+
+# Crop the raster r2, using the box previously created
+depth.proj <- crop(r2, box)
+depth.proj[depth.proj > 0] <- NA # Remove the values for the land
+
+contour.lines <- rasterToContour(depth.proj) # Get bathymetry lines
+
+# create palette
+greys <- rev(colorRampPalette(RColorBrewer::brewer.pal(9,"Greys"))(100))
+
+tmap_mode("plot")
+
+p <- tm_shape(depth.proj) +
+  tm_raster(style='cont', palette=greys, 
+            colorNA = 'grey80', alpha=.9, title = '', legend.show = FALSE) +
+  tm_shape(contour.lines) + # Plot the contour lines
+    tm_lines(lwd = 0.3, col='grey80', alpha=.6)
+print(p)
+```
+
+Let's add the boxes delimiting the survey regions on top:
+
+```{r PAM boxes, results='hide', fig.keep = 'all'}
+# BOXES
+northbox <- st_read("F:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Shapefiles/NorthBox.shp")
+southbox <- st_read("F:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Shapefiles/SouthBox.shp")
+
+# Project to the same crs as for the rest
+northbox <- st_transform(northbox, projection)
+southbox <- st_transform(southbox, projection)
+
+p <- 
+  p + tm_shape(northbox) +
+  tm_fill(alpha=.5) +
+    tm_borders(col="grey") +
+  tm_shape(southbox) +
+    tm_fill(alpha=.5) +
+    tm_borders(col="grey")
+
+print(p)
+```
+
+The next step is to add the transect lines:
+
+```{r PAM transects, results='hide', fig.keep = 'all'}
+# TRANSECT DATA
+transects <- read_sf("../01_Data/PAM_Surveys.shp") # transect lines
+sf::st_crs(transects) <- 4326 # set coordinate system (espg code of WGS84)
+transects <- st_transform(transects, projection) # project
+transects$Id <- c(1:nrow(transects)) # unique Id for each line (because some lines are split)
+
+transects$Survey <- as.factor(transects$Survey) # factors to color by survey
+palette.PAM <- c("#557A95", "#E2B4BD", "#9DD9D2", "#ECC783", "#956D90", "#91C0DC") # palette for the transect lines
+
+p <- p +
+  tm_shape(transects) +
+    tm_lines(col="Survey", palette = palette.PAM, lwd = 2, legend.col.show = F)
+
+print(p)
+```
+
+Now the sperm whale detections:
+```{r detections}
+det <- read.dbf("../01_Data/SPW_detections.dbf")
+det <- det[-17,] # remove that sighting that falls outside of the survey box
+det <- st_as_sf(det, coords=c("TMLong", "TMLat")) # transform as spatial object
+st_crs(det) <- 4326 # set the crs
+det <- st_transform(det, projection) # project
+
+p <- p + 
+  tm_shape(det) +
+    tm_symbols(size = 0.1, col = "black", border.col = "black", alpha = 0.4, 
+               border.lwd = 0.1, legend.col.show = F)
+
+print(p)
+```
+
+The contents of the map are all there. We can now add necessary elements, such as the north arrow, scale, and modify the way the legend is displayed.
+
+```{r map elements, results='hide', fig.keep = 'all'}
+p1 <- p +
+  tm_graticules(lines = FALSE) +
+  tm_compass(position=c("left", "top"), size=2) +
+  tm_scale_bar(position=c("RIGHT", "BOTTOM"), breaks = c(0,100,200), lwd = 0.1)
+
+print(p1)
+```
+
+We create the legend in another object because I want to put them altogether in PhotoShop, it's too much of a hassle to adjust positions in the viewport.
+
+First the legend for the bathymetry needs to be retrieved: 
+
+```{r legend}
+# Need to get the depth legend via the tm_raster and not with tm_add_legend
+# otherwise it does not put a continuous gradient in legend but categories
+legend.depth <- 
+  tm_shape(depth.proj) +
+  tm_raster(style='cont', palette=greys, 
+# set showNA = F or it adds something for missing data in the legend
+            colorNA = 'grey80', alpha=.9, title = "Depth (m)", showNA = FALSE) +
+  tm_shape(contour.lines) + # Plot the contour lines
+    tm_lines(lwd = 0.3, col='grey80', alpha=.6) +
+  tm_layout(legend.only = TRUE, legend.text.fontfamily = "serif", 
+            legend.title.fontface = "bold.italic", legend.title.fontfamily = "serif",
+            legend.bg.color = "white", legend.text.size = .7, legend.title.size = 1) 
+# legend.only, to retrieve the legend only
+
+print(legend.depth)
+```
+
+And the legend created manually for the rest:
+
+```{r }
+legend <-  p +
+  tm_add_legend(type="fill", labels = "  Survey regions", col = "grey", 
+                alpha =0.5, border.col="grey") +
+  tm_add_legend(type = "symbol", size = 1.03, col = "black", alpha = 0.4,
+                border.col = "black", border.lwd = 0.2, 
+                labels = "  Sperm whale detection events") +
+  tm_add_legend(type="line", col = palette.PAM, 
+                labels = c("  May 2015", "  Aug. 2015", "  Sep. 2015", "  May 2016", 
+                           "  Jun. 2016", "  Oct. 2016"), lwd = 2, title = "Transect lines") +
+  tm_layout(legend.title.fontface ="bold.italic", legend.title.size = 1.2, 
+            legend.text.size = .9, legend.bg.color = "white", 
+            legend.title.fontfamily = "serif", legend.only = TRUE, 
+            legend.text.fontfamily = "serif")
+
+print(legend)
+```
+
+Let's prepare an inset to add to the map. To do that, a shapefile of Europe is downloaded from GISCO and a box representing the study area is created below.
+
+```{r}
+# get the countries of europe - RG for having polygons
+europe <- gisco_get_countries(region = "Europe", year = "2020", epsg = "4326",
+                              resolution = 10, spatialtype = "RG")
+europe <- st_transform(europe, projection) # project it
+europe <- st_crop(europe, ymin=3444428, ymax=8027428, xmin=-1425598, xmax=4001958)
+
+surveyarea.bb <- st_as_sfc(st_bbox(depth.proj)) # create bounding box
+
+insetmap <- tm_shape(europe) +
+  tm_borders(lwd = 0.5, col = "black") +
+  tm_fill(col="grey") +
+tm_shape(surveyarea.bb) +
+  tm_borders(col = "red", lwd = 2) +
+  tm_layout(inner.margins = c(0,0,0,0), outer.margins=c(0,0,0,0))
+
+print(insetmap)
+```
+
+Let's save all the elements to work on the final product in Photoshop.
+
+```{r export, eval = FALSE}
+# print depth.proj to do xmax - xmin / ymax - ymin
+asp <- (798115.9 - (-246004.1))/(6361188 - 5323338)
+
+tmap_save(p1, filename="../03_Outputs/PAM_map.svg",
+          dpi=900, height=asp*15, width=15, units="cm")
+tmap_save(legend.depth, filename="../03_Outputs/legend_depth.svg",
+          dpi=400, scale = 1, width=5, units="cm")
+# `legend` I actually saved directly exporting from the plot window,
+# using tmap_save it was fucking up the size of the symbol for the detections
+tmap_save(insetmap, filename="../03_Outputs/inset.svg",
+          dpi=600, scale = 1, width=5, units="cm")
+```
+
+
+# Fig extra: Raincloud plots {.tabset}
+
+To visualise the environmental data in the presence and absence of sperm whales, raincloud plots are used.  
+Don't want those to be on the standardised scale, so I start from the original dataset, which I strip down to keep only the variables retained in the model (`slope2.5`, `aspect2.5`, `tpi10`, `distfront7km`, `weeksst4km`, `SLA`) and the `PA` column.
+
+```{r}
+datavis <- readRDS("../01_Data/SPW_PAM_allcovariates.rds")
+datavis <- cbind(st_coordinates(datavis), as.data.frame(st_drop_geometry(datavis)))
+select <- c("PA", "slope2.5", "aspect2.5", "tpi10", "distfront7km", "weeksst4km", "SLA")
+datavis <- datavis[,select]
+```
+
+The individual plots for each variable are found in the tabs below.
+
+## Slope {-}
+```{r}
+theme_set(theme_bw(16)) # apparently need that for the half violins
+source("https://raw.githubusercontent.com/datavizpyr/data/master/half_flat_violinplot.R")
+
+scaleFUN <- function(x) sprintf("%.1f", x) # custom function to keep trailing zeros in axis labels
+slope <- ggplot(data = datavis, aes(x = as.factor(PA), 
+                                      y = slope2.5, 
+                                      fill = as.factor(PA),
+                                      colour = as.factor(PA))) +
+  geom_flat_violin(alpha = .9, position = position_nudge(x = .12, y = 0)) +
+ # stat_ydensity(geom = "bar", colour = "white", fill = "white", width = .3) +
+  geom_jitter(width = .1, 
+              size = .3, 
+              alpha = 0.25,
+              fill = NA,
+              col = "grey30") +
+  geom_boxplot(width = 0.1, 
+               outlier.shape = NA, 
+               alpha = 0.6,
+               color = "black") +
+  labs(y="Slope (°)", x=" ") +
+  ggtitle("a") +
+  coord_flip() +
+  theme_classic() +
+  theme(legend.position = "none", axis.title.x = element_text(size=13, family = 'serif'),
+        axis.text.y = element_text(angle=90, hjust=-0.05, size=13),
+        axis.text=element_text(size=11, family = 'serif'), axis.ticks.y = element_blank(),
+        plot.title = element_text(family = "serif", size = 13, vjust = -5, hjust = 0.02),
+        plot.margin = margin(t=30, b=5, r=1)) +
+  scale_x_discrete(expand = c(0.15, 0), labels=c("Absence", "Presence")) +
+  scale_y_continuous(limits = c(0, 13), breaks = c(0,4,8,12)) +
+  scale_colour_manual(values = c("#dae5eb", "#4E6D82")) +
+  scale_fill_manual(values = c("#dae5eb", "#4E6D82"))
+
+print(slope)
+```
+
+Here are some summary statistics for `slope2.5` values when sperm whales were absent:
+```{r}
+summary(datavis$slope2.5[which(datavis$PA == 0)])
+```
+
+And when sperm whales were present:
+```{r}
+summary(datavis$slope2.5[which(datavis$PA == 1)])
+```
+
+## Aspect {-}
+```{r, echo=FALSE}
+aspect <- ggplot(data = datavis, aes(x = as.factor(PA), 
+                                      y = aspect2.5, 
+                                      fill = as.factor(PA),
+                                      colour = as.factor(PA))) +
+  geom_flat_violin(alpha = .9, position = position_nudge(x = .12, y = 0)) +
+#  stat_ydensity(geom = "bar", colour = "white", fill = "white", width = .3) +
+  geom_jitter(width = .1, 
+              size = .3, 
+              alpha = 0.25,
+              fill = NA,
+              col = "grey30") +
+  geom_boxplot(width = 0.1, 
+               outlier.shape = NA, 
+               alpha = 0.6,
+               color = "black") +
+  labs(y="Aspect (°)", x="") +
+  ggtitle("b") +
+  coord_flip() +
+  theme_classic() +
+  theme(legend.position = "none", axis.title.x = element_text(size=13, family = 'serif'),
+        axis.text.y = element_text(angle=90, hjust=-0.05),
+        axis.text=element_text(size=11, family = 'serif'), axis.ticks.y = element_blank(),
+        plot.title = element_text(family = "serif", size = 13, vjust = -5, hjust = 0.02),
+        plot.margin = margin(t=30, b=5, r=1)) +
+  scale_x_discrete(expand = c(0.15, 0), labels=c("", "")) +
+  scale_y_continuous(breaks=c(0, 120, 240, 360)) +
+  scale_colour_manual(values = c("#dae5eb", "#BFDFED")) +
+  scale_fill_manual(values = c("#dae5eb", "#BFDFED"))
+
+print(aspect)
+```
+
+Here are some summary statistics for `aspect2.5` values when sperm whales were absent:
+```{r}
+summary(datavis$aspect2.5[which(datavis$PA == 0)])
+```
+
+And when sperm whales were present:
+```{r}
+summary(datavis$aspect2.5[which(datavis$PA == 1)])
+```
+
+## TPI {-}
+```{r echo=FALSE, results = TRUE}
+tpi <- ggplot(data = datavis, aes(x = as.factor(PA), 
+                                      y = tpi10, 
+                                      fill = as.factor(PA),
+                                      colour = as.factor(PA))) +
+  geom_flat_violin(alpha = .9, position = position_nudge(x = .12, y = 0)) +
+#  stat_ydensity(geom = "bar", colour = "white", fill = "white", width = .3) +
+  geom_jitter(width = .10, 
+              size = .3, 
+              alpha = 0.25,
+              fill = NA,
+              col = "grey30") +
+  geom_boxplot(width = 0.1, 
+               outlier.shape = NA, 
+               alpha = 0.6,
+               color = "black") +
+  labs(y="Topographic position index (m)", x="") +
+  ggtitle("c") +
+  coord_flip() +
+  theme_classic() +
+  theme(legend.position = "none", axis.title.x = element_text(size=13, family = 'serif'),
+        axis.text.y = element_text(angle=90, hjust=-0.05),
+        axis.text=element_text(size=11, family = 'serif'), axis.ticks.y = element_blank(),
+        plot.title = element_text(family = "serif", size = 13, vjust = -5, hjust = 0.02),
+        plot.margin = margin(t=30, b=5, r=1)) +
+  scale_x_discrete(expand = c(0.15, 0), labels=c("", "")) +
+  scale_colour_manual(values = c("#dae5eb", "#5DA5AC")) +
+  scale_fill_manual(values = c("#dae5eb", "#5DA5AC"))
+
+print(tpi)
+```
+
+Here are some summary statistics for `tpi10` values when sperm whales were absent:
+```{r}
+summary(datavis$tpi10[which(datavis$PA == 0)])
+```
+
+And when sperm whales were present:
+```{r}
+summary(datavis$tpi10[which(datavis$PA == 1)])
+```
+
+## Distant to front {-}
+```{r, echo=FALSE}
+distfront <- ggplot(data = datavis, aes(x = as.factor(PA), 
+                                 y = distfront7km, 
+                                 fill = as.factor(PA),
+                                 colour = as.factor(PA))) +
+  geom_flat_violin(alpha = .9, position = position_nudge(x = .12, y = 0)) +
+#  stat_ydensity(geom = "bar", colour = "white", fill = "white", width = .3) +
+  geom_jitter(width = .10, 
+              size = .3, 
+              alpha = 0.25,
+              fill = NA,
+              col = "grey30") +
+  geom_boxplot(width = 0.1, 
+               outlier.shape = NA, 
+               alpha = 0.6,
+               color = "black") +
+  labs(y="Distance to front (km)", x="") +
+  ggtitle("e") +
+  coord_flip() +
+  theme_classic() +
+  theme(legend.position = "none", axis.title.x = element_text(size=13, family = 'serif'),
+        axis.text.y = element_text(angle=90, hjust=-0.04),
+        axis.text=element_text(size=11, family = 'serif'), axis.ticks.y = element_blank(),
+        plot.title = element_text(family = "serif", size = 13, vjust = -5, hjust = 0.02),
+        plot.margin = margin(t=30, b=5, r=1)) +
+  scale_x_discrete(expand = c(0.15, 0), labels=c("", "")) +
+#  scale_y_continuous(limit = range(data$depth2.5), breaks = c(0.25,0.75,1.25)) +
+  scale_colour_manual(values = c("#dae5eb", "#EBC0AD")) +
+  scale_fill_manual(values = c("#dae5eb", "#EBC0AD"))
+
+print(distfront)
+```
+
+Here are some summary statistics for `distfront7km` values when sperm whales were absent:
+```{r}
+summary(datavis$distfront7km[which(datavis$PA == 0)])
+```
+
+And when sperm whales were present:
+```{r}
+summary(datavis$distfront7km[which(datavis$PA == 1)])
+```
+
+## SST {-}
+```{r, echo=FALSE}
+sst <- ggplot(data = datavis, aes(x = as.factor(PA), 
+                                 y = weeksst4km, 
+                                 fill = as.factor(PA),
+                                 colour = as.factor(PA))) +
+  geom_flat_violin(alpha = .9, position = position_nudge(x = .12, y = 0)) +
+#  stat_ydensity(geom = "bar", colour = "white", fill = "white", width = .3) +
+  geom_jitter(width = .10, 
+              size = .3, 
+              alpha = 0.25,
+              fill = NA,
+              col = "grey30") +
+  geom_boxplot(width = 0.1, 
+               outlier.shape = NA, 
+               alpha = 0.6,
+               color = "black") +
+  labs(y="Sea surface temperature (°C)", x="") +
+  ggtitle("d") +
+  coord_flip() +
+  theme_classic() +
+  theme(legend.position = "none", axis.title.x = element_text(size=13, family = 'serif'),
+        axis.text.y = element_text(angle=90, hjust=-0.04, size=13),
+        axis.text=element_text(size=11, family = 'serif'), axis.ticks.y = element_blank(),
+        plot.title = element_text(family = "serif", size = 13, vjust = -5, hjust = 0.02),
+        plot.margin = margin(t=30, b=5, r=1)) +
+  scale_x_discrete(expand = c(0.15, 0), labels=c("Absence", "Presence")) +
+#  scale_y_continuous(limit = range(data$depth2.5), breaks = c(0.25,0.75,1.25)) +
+  scale_colour_manual(values = c("#dae5eb", "#F4CE92")) +
+  scale_fill_manual(values = c("#dae5eb", "#F4CE92"))
+
+print(sst)
+```
+
+Here are some summary statistics for `weeksst4km` values when sperm whales were absent:
+```{r}
+summary(datavis$weeksst4km[which(datavis$PA == 0)])
+```
+
+And when sperm whales were present:
+```{r}
+summary(datavis$weeksst4km[which(datavis$PA == 1)])
+```
+
+
+## SLA {-}
+```{r, echo=FALSE}
+scaleFUN <- function(x) sprintf("%.2f", x) # custom function to keep trailing zeros in axis labels
+SLA <- ggplot(data = datavis, aes(x = as.factor(PA), 
+                                 y = SLA, 
+                                 fill = as.factor(PA),
+                                 colour = as.factor(PA))) +
+  geom_flat_violin(alpha = .9, position = position_nudge(x = .12, y = 0)) +
+#  stat_ydensity(geom = "bar", colour = "white", fill = "white", width = .3) +
+  geom_jitter(width = .10, 
+              size = .3, 
+              alpha = 0.25,
+              fill = NA,
+              col = "grey30") +
+  geom_boxplot(width = 0.1, 
+               outlier.shape = NA, 
+               alpha = 0.6,
+               color = "black") +
+  labs(y="Sea level anomaly (m)", x="") +
+  ggtitle("f") +
+  coord_flip() +
+  theme_classic() +
+  theme(legend.position = "none", axis.title.x = element_text(size=13, family = 'serif'),
+        axis.text.y = element_text(angle=90, hjust=-0.04),
+        axis.text=element_text(size=11, family = 'serif'), axis.ticks.y = element_blank(),
+        plot.title = element_text(family = "serif", size = 13, vjust = -5, hjust = 0.02),
+        plot.margin = margin(t=30, b=5, r=1)) +
+  scale_x_discrete(expand = c(0.15, 0), labels=c("", "")) +
+  scale_y_continuous(breaks = c(-0.15, -0.1, -0.05, 0, 0.05, 0.10), labels = scaleFUN) +
+  scale_colour_manual(values = c("#dae5eb", "#957580")) +
+  scale_fill_manual(values = c("#dae5eb", "#957580"))
+
+print(SLA)
+```
+
+Here are some summary statistics for `SLA` values when sperm whales were absent:
+```{r}
+summary(datavis$SLA[which(datavis$PA == 0)])
+```
+
+And when sperm whales were present:
+```{r}
+summary(datavis$SLA[which(datavis$PA == 1)])
+```
+
+# {-}
+
+```{r echo=F, results='hide', fig.keep='all', out.width="80%"}
+# To save them altogether in one figure directly
+#cairo_ps(filename = "../03_Outputs/Fig.3_Observed.eps", fallback_resolution = 600, width = 10, height = 6) # Fallback_resolution for the transparency parts
+cowplot::plot_grid(slope, aspect, tpi, sst, distfront, SLA, nrow = 2, align = "hv")
+#dev.off()
+```
+
+# Fig. 4: Partial plots
+
+Initially, those below are run in the `03_Modelling.Rmd`. I copied it here too to have all figures in one place.
+
+```{r, results='hide', fig.keep='all', out.width="90%"}
+data <- readRDS("../01_Data/data_model.rds")
+pa_col <- 7 # presence absence column
+var_cols <- c(9, 11, 13, 10, 16, 14, 8, 15, 12) # change the order
+names(data[var_cols]) # double check
+
+mod_bart_final <- bart(y.train = data[ , pa_col],
+                  x.train = data[, var_cols],
+                  keeptrees = TRUE, verbose = FALSE)
+
+source("Partialplots_fun.R") # load functions
+
+aspect.pp <- aspect.partial(mod_bart, x.vars = "aspect2.5", ciwidth = 0.95, 
+                            trace=FALSE)
+front.pp <- distfront.partial(mod_bart, x.vars = "distfront7km", ciwidth = 0.95,
+                              trace=FALSE)
+sla.pp <- sla.partial(mod_bart, x.vars = "SLA", ciwidth = 0.95, 
+                      trace=FALSE)
+tpi.pp <- tpi.partial(mod_bart, x.vars = "tpi10", ciwidth = 0.95, 
+                      trace=FALSE)
+relsst.pp <- relsst.partial(mod_bart, x.vars = "relsst.month4km", ciwidth = 0.95, 
+                            trace=FALSE)
+slope.pp <- slope.partial(mod_bart, x.vars = "slope2.5", ciwidth = 0.95, 
+                          trace=FALSE)
+depth.pp <- depth.partial(mod_bart, x.vars = "depth2.5", ciwidth = 0.95, 
+                          trace=FALSE)
+chla.pp <- chla.partial(mod_bart, x.vars = "chla4km", ciwidth = 0.95, 
+                        trace=FALSE)
+
+# cairo_ps(filename = "../03_Outputs/Fig.4_PartialPlots.eps", fallback_resolution = 600, width = 13, height = 6)
+cowplot::plot_grid(aspect.pp[[1]], front.pp[[1]], sla.pp[[1]], tpi.pp[[1]], 
+                   relsst.pp[[1]], slope.pp[[1]], depth.pp[[1]], chla.pp[[1]],
+                   nrow = 2, align = "hv")
+# dev.off()
+```
+
+# Fig. 4: Favourability maps
+
+```{r load data}
+favourability.raster <- 
+  rast("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/final_pred_favourability.tif")
+```
+
+Let's start with the base map that will be common to all favourability maps: `base`.
+
+```{r basemap, results='hide', fig.keep = 'all'}
+# define bounding box for the plot area
+area.box <- as(extent(-16, -8, 48.5, 56.5), 'SpatialPolygons') # create a box as a Spatial Object
+crs(area.box) <- "+proj=longlat +datum=WGS84 +no_defs" # define the crs of this box
+box <- spTransform(area.box, CRS("+init=epsg:32629")) # project the spatial object (WGS84 UTM Z29: EPSG 32629)
+
+bbox_new <- st_bbox(box) %>%  # take the bounding box ...
+  st_as_sfc() # ... and make it a sf polygon
+
+base <- gisco_get_countries(country = c("Ireland", "United Kingdom"), 
+                               year = "2020", epsg = "4326",
+                               resolution = 1, spatialtype = "RG") %>%
+  st_transform(projection) # project it
+
+base <- tm_shape(base, bbox = bbox_new) +
+  tm_borders(lwd = 0.5, col = "grey10") +
+  tm_fill(col="grey20")
+
+print(base)
+```
+
+Now let's add the elements.
+
+```{r elements, results='hide', fig.keep = 'all'}
+graticules <- tm_graticules(lines = FALSE)
+
+# element with scale only for the last plot, as to not repeat it all the time
+scale <- tm_scale_bar(position=c("RIGHT", "BOTTOM"), breaks = c(0,100,200), lwd = 0.1)
+
+print(base + graticules + scale)
+```
+
+And now we need to create the layers which will be overlaid, corresponding to the predictions in the different months/seasons of interest: `spring`, `june`, `august` and `autumn`. 
+
+```{r prediction layers, results='hide', fig.keep = 'all'}
+# palette
+library("colorspace")
+library("viridis")
+pal1 <- rev(magma(100, alpha = 0.8))
+pal <- rev(sequential_hcl(100, palette = "Purple-Yellow"))
+
+# use this one instead
+brks <- seq(0,1,0.1)
+
+spring <- tm_shape(favourability.raster$spring) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = FALSE) +
+  tm_credits("a", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+
+june <- tm_shape(favourability.raster$june) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = FALSE)+
+  tm_credits("b", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+
+august <- tm_shape(favourability.raster$august) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = FALSE) +
+  tm_credits("c", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+
+autumn <- tm_shape(favourability.raster$autumn) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = F) +
+  tm_credits("d", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+
+print(base + graticules + scale + autumn)
+```
+
+To make it look a bit nicer I want to add a box that delimits the predictions zone. I did that in the Modelling file (`03_Modelling.Rmd`) so I'll repeat here. The tmap elements is called `zone`.
+
+```{r predictions zone, results='hide', fig.keep = 'all', warning=FALSE, message=FALSE}
+# get the bounding boxes
+northbox <- st_read("F:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Shapefiles/NorthBox.shp")
+southbox <- st_read("F:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Shapefiles/SouthBox.shp")
+# Merge them
+area <- st_union(northbox, southbox)
+
+# Create a polygon encompassing both zones, with a little buffer around
+pred.zone <- st_simplify(st_buffer(area, dist = 20000), dTolerance = 7000)
+# extended slightly the buffer so it goes well around the limits of the predictions
+zone <- 
+  tm_shape(pred.zone) +
+    tm_borders(col="grey20", lwd = 1.5, lty = 1)
+
+print(base + graticules + scale + spring + zone)
+```
+
+That looks quite good. But the transect lines would be adding an extra piece of information there, so let's add them. Only the tracks corresponding to the season/month in which the predictions were computed. Four different map elements will be created: `track.spring`, `track.june`, `track.august` and `track.autumn`.
+
+```{r add transects, results='hide', fig.keep = 'all', warning=FALSE, message=FALSE}
+track.spring <- transects[which(transects$Survey == 1 | transects$Survey == 4) ,]
+track.june <- transects[which(transects$Survey == 5) ,]
+track.august <- transects[which(transects$Survey == 2) ,]
+track.autumn <- transects[which(transects$Survey == 3 | transects$Survey == 6) ,]
+
+track.spring <-
+  tm_shape(track.spring) +
+    tm_lines(col="grey15", lwd = 0.5, legend.col.show = F)
+
+track.june <-
+  tm_shape(track.june) +
+    tm_lines(col="grey15", lwd = 0.5, legend.col.show = F)
+
+track.august <-
+  tm_shape(track.august) +
+    tm_lines(col="grey15", lwd = 0.5, legend.col.show = F)
+
+track.autumn <-
+  tm_shape(track.autumn) +
+    tm_lines(col="grey15", lwd = 0.5, legend.col.show = F)
+
+print(track.spring)
+```
+
+The sightings as well:
+
+```{r}
+det.spring <- det[which(det$month_ == 5) , ]
+det.june <- det[which(det$month_ == 6) , ]
+det.august <- det[which(det$month_ == 8) , ]
+det.autumn <- det[which(det$month_ == 9 | det$month_ == 10) , ]
+
+det.spring <- 
+  tm_shape(det.spring) +
+    tm_symbols(size = 0.1, col = "grey15", border.col = "grey15", alpha = 0.4, 
+               border.lwd = 0.1, legend.col.show = F)
+det.june <- 
+    tm_shape(det.june) +
+    tm_symbols(size = 0.1, col = "grey15", border.col = "grey15", alpha = 0.4, 
+               border.lwd = 0.1, legend.col.show = F)
+det.august <- 
+    tm_shape(det.august) +
+    tm_symbols(size = 0.1, col = "grey15", border.col = "grey15", alpha = 0.4, 
+               border.lwd = 0.1, legend.col.show = F)
+det.autumn <- 
+    tm_shape(det.autumn) +
+    tm_symbols(size = 0.1, col = "grey15", border.col = "grey15", alpha = 0.4, 
+               border.lwd = 0.1, legend.col.show = F)
+
+print(det.spring)
+```
+
+Let's also add some titles to the maps:
+
+```{r map titles, results='hide', fig.keep = 'all', warning=FALSE, message=FALSE}
+title.spring <- tm_layout(title = " May 2015-2016", title.size = 0.9,
+                          title.bg.color = "white", title.position = c("LEFT", "TOP"),
+                          title.fontfamily = "serif")
+title.june <- tm_layout(title = " June 2016", title.size = 0.9,
+                          title.bg.color = "white", title.position = c("LEFT", "TOP"),
+                          title.fontfamily = "serif")
+title.august <- tm_layout(title = " August 2015", title.size = 0.9,
+                          title.bg.color = "white", title.position = c("LEFT", "TOP"),
+                          title.fontfamily = "serif")
+title.autumn <- tm_layout(title = " Sept-Oct 2015-2016", title.size = 0.9,
+                          title.bg.color = "white", title.position = c("LEFT", "TOP"),
+                          title.fontfamily = "serif")
+```
+
+For the legend, I want the terra version of it. I didn't find a work around so I'm exporting the image below from the plot window and will cut and add the legend myself to my plot!
+
+```{r legend preds, results='hide'}
+legend <- terra::plot(favourability.raster$autumn, col=pal, cex=16)
+```
+
+Now let's create the final maps. Only one of them is displayed.
+
+```{r final maps, results='hide'}
+fav.spring <- base + graticules + spring + zone + track.spring + det.spring + 
+  title.spring
+fav.june <- base + graticules + june + zone + track.june + det.june + title.june
+fav.august <- base + graticules + august + zone + track.august + det.august + 
+  title.august
+fav.autumn <- base + graticules + scale + autumn + zone + track.autumn + 
+  det.autumn + title.autumn
+
+print(fav.autumn)
+```
+
+Save all elements. I'm saving them all as `.png` and not `.svg` because the latter generates files that are way too heavy (~88 MB).
+
+```{r eval=FALSE}
+# print bbox_new to get the limits to do: xmax - xmin / ymax - ymin
+asp <- (573871.4 - (-16944.78))/(6283704 - 5372358)
+tmap_save(pred.spring, filename="../03_Outputs/fig5.spring.png",
+          dpi=900, height=asp*15, width=15, units="cm")
+tmap_save(pred.june, filename="../03_Outputs/fig5.june.png",
+          dpi=900, height=asp*15, width=15, units="cm")
+tmap_save(pred.august, filename="../03_Outputs/fig5.aug.png",
+          dpi=900, height=asp*15, width=15, units="cm")
+tmap_save(pred.autumn, filename="../03_Outputs/fig5.aut.png",
+          dpi=900, height=asp*15, width=15, units="cm")
+```
+
+# Extra: Predictions and uncertainty
+
+```{r prep}
+predictions.rast <- rast("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/final_predictions.tif")
+my_palette <- colorRampPalette(c("#264653", "#86c9dd", "#e5b761", "#efd199"))
+```
+
+We can re-use all the elements from before and just add the new raster layers to replace that of the favourability.
+So let's just prepare the prediction layers:
+
+```{r pred uncert layers}
+spring.pred <- tm_shape(predictions.rast$spring) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = FALSE) +
+  tm_credits("a", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+
+june.pred <- tm_shape(predictions.rast$june) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = FALSE)+
+  tm_credits("b", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+
+august.pred <- tm_shape(predictions.rast$august) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = FALSE) +
+  tm_credits("c", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+
+autumn.pred <- tm_shape(predictions.rast$autumn) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = F) +
+  tm_credits("d", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+
+
+# Compute uncertainty layers
+spring.uncert <- tm_shape(predictions.rast$spring.q2 - predictions.rast$spring.q1) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = FALSE) +
+  tm_credits("a", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+
+june.pred <-  tm_shape(predictions.rast$june.q2 - predictions.rast$june.q1) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = FALSE) +
+  tm_credits("a", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+
+august.pred <-  tm_shape(predictions.rast$august.q2 - predictions.rast$august.q1) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = FALSE) +
+  tm_credits("a", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+
+autumn.pred <-  tm_shape(predictions.rast$autumn.q2 - predictions.rast$autumn.q1) +
+  tm_raster(palette = my_palette(100), style = "cont", breaks = brks, legend.show = FALSE) +
+  tm_credits("a", fontfamily = "serif", position = c("LEFT", "BOTTOM"), size = 0.9)
+```
+
+
+
+```{r pred maps, results='hide'}
+pred.spring <- base + graticules + spring + zone + track.spring + det.spring + title.spring
+```

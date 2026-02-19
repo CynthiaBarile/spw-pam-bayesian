@@ -1,0 +1,1500 @@
+---
+title: 'Dataset preparation - PAM for SPW'
+author: "Cynthia Barile"
+output:
+  html_document:
+    theme: journal
+    highlight: breezedark
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: 
+      collapsed: false # to prevent collapsing down smaller headers
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+bibliography: "C:/Users/cynth/Google Drive/PhD/BibTeX/PhD_papers.bib"
+link-citations: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE)
+
+## The lines below are to modify the style of the document, in particular here to extend the margins in the HTML
+```
+
+<style type="text/css">
+.main-container {
+  max-width: 1800px !important;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+```{r packages}
+# Set wd to the folder containing this script
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path)) 
+
+library(dplyr)
+library(foreign) # load dbf files
+library(ggplot2)
+library(marmap) # To open bathymetry data
+library(raster) # work with rasters
+library(rasterVis) # Enhanced visualisation of raster data
+# Errors raster package when loading marmap
+# Uninstall raster and re-install with this command
+# install.packages("raster", repos="http://R-Forge.R-project.org") 
+library(sf)
+library(terra) # work with spatial data for SDMs
+library(zoo) # na.approx function to interpolate NAs in chla data
+```
+
+**NOTE**: Upon finishing this Markdown and generating the final data table to be used for scale selection and subsequent modelling, the folders have been backed up.  
+At a later stage, if the data used in this markdown is not in my GitHub repo anymore, it will always be on my hard drives, under `PhD/Ch4_Modelling_SPW_PAM` and/or in `PhD/ObSERVE_MASTER/ObSERVE_PAM`. 
+
+# Presence/absence data
+## GPS data
+
+Before starting, I need a file containing GPS points and associated time stamps (will need it later to re-assign time stamps to each segment that I will generate later).
+
+Start by importing all .csv files with GPS data, merging them into one and tidying it a bit.
+
+```{r gps data, eval=FALSE}
+# path to back up folder with raw data
+backup <- "E:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Raw_databases"
+# list csv files in the folder
+gps <- list.files(backup, pattern = ".csv")
+
+# dummy list to fill
+pam.gps <- list()
+# read the csv files and store in list
+for (i in seq_along(gps)) {
+  setwd(backup) # set directory here 
+  pam.gps[[i]] <- read.csv(gps[[i]])
+}
+
+# bind rows of each element of the list (each survey) into a single data frame
+pam.gps <- bind_rows(pam.gps)
+# remove the encoding issue at beginning of column 1
+colnames(pam.gps)[1] <- gsub('^...','', colnames(pam.gps)[1])
+# reorder dataframe based on survey id and id of observation (from each survey)
+pam.gps <- arrange(pam.gps, pam.gps$survey, pam.gps$Id)
+
+# save the object in the Raw_Databases folder
+saveRDS(pam.gps, file="E:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Raw_databases/pam_gps.rds")
+```
+
+Now we can work from that object directly. In this `pam.gps` object, there is GPS data every few seconds. That's too much and I don't need that level of detail, so I will keep only one point per minute.
+
+```{r gps data minute, eval=FALSE}
+# Open that object we created earlier
+pam.gps <- readRDS(file="E:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Raw_Databases/pam_gps.rds")
+# add an index column (with cbind so it adds it as first column)
+pam.gps <- cbind(index = 1:nrow(pam.gps), pam.gps)
+# create a column with date/time info in POSIX format, down to the minute (discard seconds)
+pam.gps$DateTime <- as.POSIXct(paste(pam.gps$gpsData_UTCDate, pam.gps$gpsData_UTCTime),
+                               format="%d/%m/%Y %H:%M")
+
+pam.gps <- pam.gps %>% # apply the following to the pam.gps object:
+  group_by(DateTime) %>% # group rows which have identical DateTime info 
+  slice(1) %>% # keep only the first occurrence (the first per minute basically)
+  ungroup() %>% # remove grouping and save
+  saveRDS(file="E:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Raw_Databases/pam_gps_1min.rds")
+```
+
+The gps data of all surveys (precision down to one point per minute) is now stored as an R object as `pam_gps_1min.rds`.
+
+__**UPDATE**__ In the end, I will use the full gps data `pam.gps`, instead of the one downsampled every minute. This is because of PAM1 - the horizontal line crosses on different point the zig-zag, so I'm worried I will match the wrong time stamp to the centroids that are on the intersection. I'm still keeping that file downsampled, just in case.
+
+## Transect data
+
+Followed instructions of [David Miller](http://examples.distancesampling.org/dsm-data-formatting/dsm-data-formatting.html) from CREEM.
+
+We first load the shapefile of the transect data into R.
+
+```{r transect}
+# PAM_Surveys.shp in hard drive in the ObSERVE_MASTER folder
+transects <- read_sf("../01_Data/PAM_Surveys.shp") # transect lines
+
+sf::st_crs(transects) <- 4326 # set coordinate system (espg code of WGS84)
+
+transects$Id <- c(1:nrow(transects)) # unique Id for each line (because some lines are split)
+
+# quick plot to see if the data loaded properly
+p <- ggplot() +
+  geom_sf(data=transects, aes(colour=as.factor(Survey))) + # as.factor to have discrete scale
+  theme_minimal()
+
+print(p)
+```
+
+If we print `transects`, we see that we have one row per transect (8 total here, because some are split in several lines).  
+We can now use the `st_segmentize` function to take each transect and divide it into smaller segments.
+
+The transect lines should be **segmented every 4 km** (page 46 in @Berrow2018a; @Gordon2020).  
+But first, we need to project the data as we will need to have units in meters to cut. We transform back to lat/long after.
+
+```{r segments}
+# project transects
+transects <- st_transform(transects, 32629) # espg code UTM 29
+
+# do the segmenting
+segments <- st_segmentize(transects, dfMaxLength = units::set_units(4000, "meters"))
+
+# transform back to lat/long
+segments <- st_transform(segments, 4326)
+transects <- st_transform(transects, 4326)
+
+# check differences
+# st_coordinates(segments[1,]) # 291 sets of coordinates
+st_coordinates(transects[1,]) # 9 sets of coordinates
+```
+
+In the new `segments` objects, there are many more coordinates attached to each row (i.e. transect line). All those sets of coordinates correspond to our segment cut points.
+
+Now, we need to break up the rows of `segments` into multiple rows, one per segment. We use a function provided by [dieghernan](https://dieghernan.github.io/) on their [website](https://dieghernan.github.io/201905_Cast-to-subsegments/). The function name is `stdh_cast_substring`.
+
+```{r dieghernan function, include=FALSE}
+stdh_cast_substring <- function(x, to = "MULTILINESTRING") {
+  ggg <- st_geometry(x)
+
+  if (!unique(st_geometry_type(ggg)) %in% c("POLYGON", "LINESTRING")) {
+    stop("Input should be  LINESTRING or POLYGON")
+  }
+  for (k in 1:length(st_geometry(ggg))) {
+    sub <- ggg[k]
+    geom <- lapply(
+      1:(length(st_coordinates(sub)[, 1]) - 1),
+      function(i)
+        rbind(
+          as.numeric(st_coordinates(sub)[i, 1:2]),
+          as.numeric(st_coordinates(sub)[i + 1, 1:2])
+        )
+    ) %>%
+      st_multilinestring() %>%
+      st_sfc()
+
+    if (k == 1) {
+      endgeom <- geom
+    }
+    else {
+      endgeom <- rbind(endgeom, geom)
+    }
+  }
+  endgeom <- endgeom %>% st_sfc(crs = st_crs(x))
+  if (class(x)[1] == "sf") {
+    endgeom <- st_set_geometry(x, endgeom)
+  }
+  if (to == "LINESTRING") {
+    endgeom <- endgeom %>% st_cast("LINESTRING")
+  }
+  return(endgeom)
+}
+```
+
+Let's apply the function to separate the segments and have a look at the results:
+
+```{r segments separation}
+segments <- stdh_cast_substring(segments, to="LINESTRING")
+segments
+```
+
+We now have 1,871 segments! We can check the lengths of the segments using the `st_length` function and plot a histogram:
+
+```{r segment lengths}
+hist(st_length(segments), xlab="Segment lengths (m)", main="")
+```
+
+The `dfMaxLength` argument to `st_segmentize` gives a rough guide to the segment length and the algorithm tries to get segments as equal in length as possible.
+
+We will take notice of the (great!) fact that the `Id` and `Survey` columns have now duplicate entries, since each transect was split in multiple segments. Now we need to create columns that will be useful for our model.
+
+First, just in case (and for descriptive stats maybe), an `Effort` column will be added using `st_lengths`:
+
+```{r}
+segments$Effort <- st_length(segments)
+```
+
+Then we need to generate sample labels. The label follows the format: PAM-*survey_id*-*segment_id*. 
+
+```{r sample labels}
+# create a dummy column to be filled with the loop
+segments$SampleLabel <- NA
+
+# loop over survey IDs
+for(this_transect in unique(segments$Survey)){
+  # how many segments in this transect?
+  n_segs <- nrow(subset(segments, Survey==this_transect))
+  # generate the n_segs labels that we need
+  segments$SampleLabel[segments$Survey==this_transect] <- paste("PAM", this_transect, 
+                                                            1:n_segs, sep="-")
+}
+```
+
+For later on, it's better to work with the centroids of the segments to extract the values of environmental data. This can be done with the function `st_centroid`.  
+The data needs to be projected before though, or the centroids won't be calculated correctly.
+
+```{r centroids}
+# Save the line version of segments for plotting later
+segments_lines <- segments
+
+# Project segments
+segments <- st_transform(segments, 32629)
+
+# Find centroids
+segments <- st_centroid(segments)
+
+# project back to lat/long
+segments <- st_transform(segments, 4326)
+
+# how does that look like?
+head(segments)
+```
+
+The new geometry type is now POINT. Let's plot those centroids on the previous map (we plot only one survey or it's too zoomed out and we cannot see):
+
+```{r map centroids}
+p <- ggplot() +
+  geom_sf(data=transects[which(transects$Survey=="1"),]) +
+  geom_sf(data=segments[which(segments$Survey=="1"),]) +
+  theme_minimal()
+print(p)
+```
+
+## Adding segments' timestamps
+
+Now this is all great, but there is no date/time information associated to the centroids of the segments. This is going to be a problem to extract covariate data. To counteract this, we can use the `st_join` function combined with `st_nearest_feature` (same procedure as the one to link the detections - see next section).
+
+First, we need to load the gps data.
+```{r gps}
+# gps data in ObSERVE_MASTER folder in hard drive
+pam.gps <- readRDS(file="../01_Data/pam_gps.rds")
+# to match the time stamps with the segments centroid, both objects need to be of class`sf`
+pam.gps <- st_as_sf(pam.gps, coords=c("Longitude", "Latitude"))
+# set the coordinate system
+st_crs(pam.gps) <- 4326
+```
+
+__**NOTE**__: The `pam.gps` was plotted to make sure there were no issues. For PAM1, some points had extreme coordinates (GPS error and departure of the Song of the Whale from Plymouth). Those were all removed from the original .csv file. I'm not replotting, because it takes very long considering the precision of this gps data.
+
+To avoid issues with the join, everything needs to be projected first. Then the join is performed, survey by survey (as for next section) to avoid matching the wrong time stamps with centroids close to intersections between lines from different surveys.
+
+```{r timestamps join}
+# project
+segments <- st_transform(segments, 32629) 
+pam.gps <- st_transform(pam.gps, 32629)
+
+# do the join, again per survey
+mylist <- list()
+for (survey in 1:6){
+  mylist[[survey]] <- st_join(segments[which(segments$Survey == survey),], # for all centroids
+                              pam.gps[which(pam.gps$survey == survey),], # find in pam.gps points
+                              join=st_nearest_feature) # the closest, and join. 
+}
+
+# project back to lat/long
+segments <- st_transform(segments, 4326)
+mylist <- lapply(mylist, st_transform, 4326)
+
+segments.timestamp <- bind_rows(mylist, .id = "column_label")
+head(segments.timestamp)
+```
+
+This step finishes with a `segments.timestamp` data.frame object, containing all segments and their associated date/time information (for their centroids).
+
+## Linking detections and segments
+
+In this method, we will assign detections to segments based on their distance (i.e., detections are associated with their closest segment centroid). I still follow the instructions from Miller (see first section for reference).
+
+First, we load the detection data for sperm whales.
+
+```{r detections}
+# SPW_detections.dbf in hard drive in the ObSERVE_MASTER folder 
+# And in 01_Data subfolder in this chapter's folder
+det <- read.dbf("../01_Data/SPW_detections.dbf")
+
+# add a column to account for survey ID
+det$Month_Yr <- format(as.Date(det$UTC), "%Y-%m") # first get year/month
+# for each different value of Month_Yr, change value. 
+det$Survey <- as.numeric(factor(det$Month_Yr))
+
+head(det)
+```
+
+We need to make this `data.frame` be an `sf` object by specifying that the columns of latitude and longitude contain spatial coordinates. I select the lat/long data corresponding to the actual position of the animals, derived via target motion analysis. 
+
+```{r detections sf}
+det <- st_as_sf(det, coords=c("TMLong", "TMLat"))
+# set the coordinate system
+st_crs(det) <- 4326
+det
+```
+
+We can overlay this on our map of transects:
+
+```{r detections map}
+p <- ggplot() +
+  geom_sf(data = transects, aes(col=as.factor(Survey))) +
+  geom_sf(data = det, size = 0.5, col = "black") +
+  theme_minimal()
+print(p)
+```
+
+Going back to our new `segments.timestamps` object created in the previous step. Like we did for the time stamps, we can use the `st_join` function, combined with the `st_nearest_feature` function to link the detections to those segments. Again, we first need to project the data to avoid issues.
+
+```{r assign detections}
+# project segments
+segments.timestamp <- st_transform(segments.timestamp, 32629)
+det <- st_transform(det, 32629)
+
+# do the join per survey
+mylist <- list()
+for (survey in 1:6){
+  mylist[[survey]] <- st_join(det[which(det$Survey == survey),], 
+                              segments.timestamp[which(segments.timestamp$survey == survey),],
+                              join=st_nearest_feature)
+}
+
+# project back to lat/long
+segments.timestamp <- st_transform(segments.timestamp, 4326)
+mylist <- lapply(mylist, st_transform, 4326) # apply to all elements of the list
+
+# how does it look like?
+head(mylist[[1]])
+```
+
+Now, `det` has acquired additional columns from `segments.timestamp`, including the `SampleLabel` and `Effort`. To check this worked okay, we can plot the elements of `mylist` and `segments_lines` (the line version of the segments which we created in an earlier section) with colour coding for the `SampleLabel`. We randomize the colour order so it will be easier to tell if observations are misallocated.
+
+```{r verification, out.width="200%"}
+# make a random colour palette to avoid similar colours being near one another
+pal <- rainbow(nrow(segments), s=.6, v=.9)[sample(1:nrow(segments), nrow(segments))]
+
+# loop over all the elements of the list (all surveys)
+for (survey in 1:6) {
+p[[survey]] <- ggplot() +
+  geom_sf(data=segments_lines[which(segments_lines$Survey==survey),], aes(colour=SampleLabel)) +
+  geom_sf(data=mylist[[survey]], size=0.7, aes(colour=SampleLabel)) +
+  scale_colour_manual(values=pal) +
+  theme_minimal() +
+  theme(legend.position = "none")
+}
+
+# how does it look like? (for each survey)
+gridExtra::grid.arrange(p[[1]], p[[2]], p[[3]], p[[4]], p[[5]], p[[6]], ncol=3, nrow=2)
+```
+
+Everything seems to be fine. I don't want to keep those as a list so I will bind the individual list elements into one big data frame. But to do this the geometry needs to be dropped (as right now it is an `sf` object, but we need a traditional data frame).
+
+```{r detections data}
+# drop the geometry and convert each list element back into a traditional data frame
+for (survey in 1:6){
+mylist[[survey]] <- cbind(as.data.frame(st_drop_geometry(mylist[[survey]])),
+                   st_coordinates(mylist[[survey]]))
+}
+
+# now, bind all those list elements into a single data frame.
+spw.det <- bind_rows(mylist, .id = "column_label")
+```
+
+## Presence/absence column
+
+We now have two different data sets:  
+* `segments.timestamps`, which contains all 4 km segments (coordinates of the centroids), their respective labels and time stamps.  
+* `spw.det`, which contains all detections and the corresponding segments in which they occurred.  
+
+The information in those data frames needs to be translated into presence/absence for each segment contained in `segments.timestamps`. To do this, the data frames are first merged, to have all columns from both data frames (I prefer having everything until the end and delete what isn't necessary in the last steps):
+
+```{r merge tables}
+# drop geometry from segments.timestamps first
+segments.timestamp <- cbind(as.data.frame(st_drop_geometry(segments.timestamp)),
+                            st_coordinates(segments.timestamp))
+
+# join the tables by SampleLabel
+segs.PA <- left_join(segments.timestamp, spw.det, 
+                     by = c("SampleLabel" = "SampleLabel"))
+
+# Delete duplicated segments (come from spw.det, when several detections in a single segment)
+segs.PA <- segs.PA[!duplicated(segs.PA$SampleLabel),]
+# reset rownames or it will skip numbers after having removed some rows
+rownames(segs.PA) = seq(length=nrow(segs.PA))
+```
+
+The new object `segs.PA` contains now all segments and corresponding sightings.  
+A presence/absence column must now be created:
+
+```{r pa column}
+# If NA in any column that comes from the detection data frame, put 0 in the new PA column
+# else, put 1
+segs.PA$PA <- ifelse(is.na(segs.PA$OBJECTID), 0, 1)
+```
+
+This table needs to be cleaned to keep only useful columns:
+
+```{r table cleaning}
+# keep only the following and put them in this order
+segs.PA <- segs.PA[,c("Survey", "SampleLabel", "X.x", "Y.x", 
+                      "gpsData_UTCDate.x", "gpsData_UTCTime.x", "PA")]
+# rename columns 3 to 6
+colnames(segs.PA)[c(3:6)] <- c("Long", "Lat", "UTCDate", "UTCTime")
+# how does that look like?
+head(segs.PA)
+```
+
+Let's save this data frame. Covariates data will be appended to it in the next steps. 
+
+```{r export PA}
+# Create a folder called "Outputs", one level up the current directory
+# dir.create("../03_Outputs") 
+# saveRDS(segs.PA, file="../03_Outputs/segments_pa.rds") # save segs.PA
+# backed up in the folder for this PhD chapter too (01_Data) + in ObSERVE_MASTER 
+
+# before the next steps, let's clear all objects
+rm(list = ls())
+
+# and reload only our table
+segs.PA <- readRDS("../01_Data/segments_pa.rds")
+```
+
+# Environmental variables
+
+All the raster `.nc` files containing the data used in the rest of this Markdown has now been backed up in hard drives. They can be found in the following path: `PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters`.
+
+## Static variables {.tabset}
+
+__**Summary**__  
+List of static variables + scales investigated:  
+
+* __Depth__ (depth of the seabed, in m): 30 arc-sec, 2.5 arc-min, 5 arc-min, 10 arc-min.  
+* __Slope__ gradient (indicating the maximum rate of change in depth, in degrees): 30 arc-sec, 2.5 arc-min, 5 arc-min, 10 arc-min.  
+* __Slope aspect__ (indicating the compass orientation of the slope): 30 arc-sec, 2.5 arc-min, 5 arc-min, 10 arc-min.  
+* __Rugosity__ (standard deviation of depth, in m): 30 arc-sec, 2.5 arc-min, 5 arc-min, 10 arc-min.  
+* __Topographic Position Index__ (difference between the value of depth in a cell and the mean value of the eight surrounding cells, in m): 30 arc-sec, 2.5 arc-min, 5 arc-min, 10 arc-min.  
+
+The code to generate each variable is given per-variable in the next tabs.
+See @Pirotta2020, who used those variables.
+
+### Bathymetry {-}
+
+Obtained from the General Bathymetric Chart of the Oceans dataset (GEBCO; [http://www.gebco.net](http://www.gebco.net) as a netCDF file of 15 arc-second resolution.  
+It is immediately converted as a `SpatRaster` object for use with `terra` (@Hijmans2021).
+
+```{r bathymetry}
+depth15sec <- readGEBCO.bathy("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Bathymetry/gebco_2021_n58.0_s46.0_w-20.0_e-5.0.nc") %>%
+  marmap::as.raster() %>% # Need to convert to a raster first
+  rast(crs = crs.ref) # and from raster to a SpatRaster (terra format)
+
+depth15sec[depth15sec > 0] <- NA # Remove the values for the land
+depth15sec <- project(depth15sec, "epsg:32629") # need to work on projected data
+```
+
+`depth15sec` contains depth data from GEBCO at a resolution of 15 sec-arc. Nice for mapping but such a high resolution is not really needed for the analysis. So it has to be aggregated.
+
+`depth15sec` is the starting point so it needs to be aggregated with a factor of 2 (30 arc-sec), 10 (2.5 arc-min), 20 (5 arc-min) and 40 (10 arc-min).
+
+```{r depth, results='hide', fig.keep = 'all', out.width="80%"}
+scale.arc <- c(0.5, 2.5, 5, 10) # Scales in arc-min (30 arc-sec, 2.5 arc-min, etc.)
+agg.factor <- c(2, 10, 20, 40) # Factors of aggregation 
+
+depth.agg.fun <- function(agg.factor){ # agg.factor as argument
+  aggregate(depth15sec, fact = agg.factor, fun = mean) # function
+}
+
+## apply function using different values of agg.factor
+depth.layers <- lapply(agg.factor, depth.agg.fun) 
+
+# extent box to crop everything on it
+area.box <- as(extent(-17.00, -7.995, 47.00, 57.00), 'SpatialPolygons') 
+crs(area.box) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs" # define crs
+area.box <- spTransform(area.box, 
+            CRS("+proj=utm +zone=29 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"))
+
+# crop
+depth.layers <- lapply(depth.layers, crop, area.box) 
+
+# rename list elements
+names(depth.layers) <- paste0("depth", scale.arc, "min")
+
+# plot layers and set 'main' as the name of each depth.layers element
+par(mfrow = c(2,2))
+sapply(names(depth.layers), function(x) plot(depth.layers[[x]], main = x))
+
+# save each element of the list
+list2env(depth.layers, envir = .GlobalEnv)
+```
+
+Now that we have those raster data layers, we need to extract the values that we need and add them to our `segs.PA` data table.  
+First, `segs.PA` needs to be an `sf` object, so we need to convert it to have that `geometry` column.  
+
+To extract the value of the raster cells in which each data point falls, the function `extract()` from `terra` package is used.
+
+```{r extract depth}
+# Convert as sf object
+segs.PA <- st_as_sf(segs.PA, coords=c("Long", "Lat"))
+st_crs(segs.PA) <- 4326
+segs.PA <- st_transform(segs.PA, 32629)
+
+# extract values of depth for each data point in segs.PA
+# [, -1] to keep only the column with the values, because extract() creates a df with an ID
+segs.PA$depth0.5 <- terra::extract(depth0.5min, vect(segs.PA$geometry))[, -1]
+segs.PA$depth2.5 <- terra::extract(depth2.5min, vect(segs.PA$geometry))[, -1]
+segs.PA$depth5 <- terra::extract(depth5min, vect(segs.PA$geometry))[, -1]
+segs.PA$depth10 <- terra::extract(depth10min, vect(segs.PA$geometry))[, -1]
+```
+
+### Slope gradient {-}
+
+To generate the **slope gradient**, the `terrain` function from the `terra` package is used, setting `v = "slope"`.     
+The function is applied to all elements of `depth.layers` and the resulting list is saved as `slope.layers` and contains raster layers at the scales chosen.
+
+```{r slope, results='hide', fig.keep = 'all', out.width="80%"}
+slope.layers <- lapply(depth.layers, terrain, 
+                       v = "slope", neighbors = 8, unit = "degrees") # args of terrain
+names(slope.layers) <- paste0("slope", scale.arc, "min") # rename list elements
+
+# plot
+par(mfrow = c(2,2))
+sapply(names(slope.layers), function(x) plot(slope.layers[[x]], main = x))
+
+# save each slope layer
+list2env(slope.layers, envir = .GlobalEnv) 
+```
+
+Let's extract the values from the raster and append them in the modelling data table.
+
+```{r extract slope}
+segs.PA$slope2.5 <- terra::extract(slope2.5min, vect(segs.PA$geometry))[, -1]
+segs.PA$slope5 <- terra::extract(slope5min, vect(segs.PA$geometry))[, -1]
+segs.PA$slope10 <- terra::extract(slope10min, vect(segs.PA$geometry))[, -1]
+```
+
+### Aspect {-}
+
+To generate the **aspect** of the slope, the `terrain` function from the `terra` package is used, setting `v = "aspect"`.  
+The function is applied to all elements of `depth.layers` and the resulting list is saved as `slope.layers` and contains raster layers at the scales chosen.
+
+The aspect is a circular variable, so 0 and 360 represent the same thing (north). A better way to use the information is to convert it into two new variables: **northness** = cos(aspect) and **eastness** = sin(aspect). Note that aspect must be in radians before doing this.
+
+```{r aspect, results='hide', fig.keep = 'all', out.width="80%"}
+aspect.layers <- lapply(depth.layers, terrain, 
+                       v = "aspect", neighbors = 8, unit = "radians") # args of terrain
+northness.layers <- lapply(aspect.layers, function(x) cos(x))
+eastness.layers <- lapply(aspect.layers, function(x) sin(x))
+
+names(northness.layers) <- paste0("northness", scale.arc, "min") # rename list elements
+names(eastness.layers) <- paste0("eastness", scale.arc, "min") # rename list elements
+
+# plot
+par(mfrow = c(2,2))
+sapply(names(northness.layers), function(x) plot(northness.layers[[x]], main = x))
+
+par(mfrow = c(2,2))
+sapply(names(eastness.layers), function(x) plot(eastness.layers[[x]], main = x))
+
+list2env(northness.layers, envir = .GlobalEnv)
+list2env(eastness.layers, envir = .GlobalEnv)
+```
+
+Let's extract the values from the raster and append them in the modelling data table.
+
+```{r extract aspect}
+segs.PA$northness2.5 <- terra::extract(northness2.5min, vect(segs.PA$geometry))[, -1]
+segs.PA$northness5 <- terra::extract(northness5min, vect(segs.PA$geometry))[, -1]
+segs.PA$northness10 <- terra::extract(northness10min, vect(segs.PA$geometry))[, -1]
+segs.PA$eastness2.5 <- terra::extract(eastness2.5min, vect(segs.PA$geometry))[, -1]
+segs.PA$eastness5 <- terra::extract(eastness5min, vect(segs.PA$geometry))[, -1]
+segs.PA$eastness10 <- terra::extract(eastness10min, vect(segs.PA$geometry))[, -1]
+```
+
+### Rugosity {-}
+
+To generate the **rugosity**, a simple standard deviation calculation from the depth is needed, which is done with a simple raster algebra operation on the `SpatRaster` objects.  
+But **be careful**! The `focal` function from `terra` should be used, since calculations are run on a single layer, comparing values in neighbouring cells. `w = 3` means the 8 neighbouring cells are considered in the calculation.
+
+```{r rugosity, results='hide', fig.keep='all', out.width="80%"}
+rugosity.layers <- lapply(depth.layers, focal,
+                          w = 3, fun = "sd") # args for 'focal'
+names(rugosity.layers) <- paste0("rugosity", scale.arc, "min") # rename list elements
+
+# plot
+par(mfrow = c(2,2))
+sapply(names(rugosity.layers), function(x) plot(rugosity.layers[[x]], main = x))
+
+list2env(rugosity.layers, envir = .GlobalEnv)
+```
+
+Let's extract the values from the raster and append them in the modelling data table.
+
+```{r extract rugosity}
+segs.PA$rugosity2.5 <- terra::extract(rugosity2.5min, vect(segs.PA$geometry))[, -1]
+segs.PA$rugosity5 <- terra::extract(rugosity5min, vect(segs.PA$geometry))[, -1]
+segs.PA$rugosity10 <- terra::extract(rugosity10min, vect(segs.PA$geometry))[, -1]
+```
+
+### TPI {-}
+
+To generate the **TPI**, the function `terrain` from `terra` can be used.
+
+```{r tpi, results='hide', fig.keep='all', out.width="80%"}
+tpi.layers <- lapply(depth.layers, terrain,
+                          v = "TPI", neighbors = 8) # args for 'terrain'
+names(tpi.layers) <- paste0("tpi", scale.arc, "min") # rename list elements
+
+# plot
+par(mfrow = c(2,2))
+sapply(names(tpi.layers), function(x) plot(tpi.layers[[x]], main = x))
+
+list2env(tpi.layers, envir = .GlobalEnv)
+```
+
+Let's extract the values from the raster and append them in the modelling data table.
+
+```{r extract tpi}
+segs.PA$tpi2.5 <- terra::extract(tpi2.5min, vect(segs.PA$geometry))[, -1]
+segs.PA$tpi5 <- terra::extract(tpi5min, vect(segs.PA$geometry))[, -1]
+segs.PA$tpi10 <- terra::extract(tpi10min, vect(segs.PA$geometry))[, -1]
+```
+
+## Dynamic variables {.tabset}
+
+__**Summary**__  
+List of static variables + scales investigated:  
+
+* __Chlorophyll-a__ concentration: monthly mean, averaged over 3 mo prior to survey months - 4 x 4 km, 10 x 10 km, 20 x 20 km.  
+* __Distance to nearest major front__ (km): monthly composite - 7 x 7 km, 20 x 20 km.  
+* __Frontal gradient magnitude__ (°C km<sup>-1</sup>): monthly mean thermal frontal gradient magnitude. Can also be referred to as ocean front strength. Generally, as the strength of an ocean front increases, so does the productivity associated with it. Monthly composite - 7 x 7 km, 20 x 20 km.  
+* __SST__ (sea surface temperature, °C): weekly and monthly composites - 4 x 4 km, 10 x 10 km, 20 x 20 km.  
+* __SST deviation__ in each cell from monthly median (*"to allow whale presence to respond to relative temperatures because the median SST varied between years, thus better reflecting the choices available to the animals; hereafter SST deviation"* - @Pirotta2020): monthly composite - 4 x 4 km, 10 x 10 km, 20 x 20 km.    
+* __Standard deviation of SST__ (variation in SST across a window of 5 cells): weekly and monthly composites - 4 x 4 km, 10 x 10 km, 20 x 20 km.  
+* __Sea Level Anomaly__ (SLA; sea surface height above the mean in a 20-year period): daily - 0.25° x 0.25°.  
+
+The processing and extraction of each variable can be found below in the different tabs.
+
+### Chlorophyll a {-}
+
+For chlorophyll a concentration, the methodology from @Pirotta2011, @Eguiguren2019 is applied to account for the temporal lag. For each survey, the monthly mean of chla concentration averaged over 3 months prior to the survey month is extracted.  
+Three spatial scales are tested: 4 x 4km, 10 x 10km and 20 x 20km.  
+
+__**Chla dataset**__  
+North Altantic Chlorophyll Concentration from Satellite observations (daily average) Reprocessed L4 (ESA-CCI): monthly.  
+* __Product ID__: [OCEANCOLOUR_ATL_CHL_L4_REP_OBSERVATIONS_009_091](https://resources.marine.copernicus.eu/product-detail/OCEANCOLOUR_ATL_CHL_L4_REP_OBSERVATIONS_009_091/INFORMATION).  
+* __Date accessed__: 18/02/2022  
+* __Spatial resolution__: 1 km x 1 km
+
+First the chla datasets (two, one for each year) downloaded on Marine Copernicus need to be loaded. 
+
+```{r chla data, message=FALSE, warning=FALSE, results='hide'}
+# create a Raster Stack - paste() so I can break the file path on several lines
+projection <- "+proj=utm +zone=29 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
+
+chla.2015 <- stack(paste("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Chlorophyll/",
+                         "dataset-oc-atl-chl-multi_cci-l4-chl_1km_monthly",
+                         "-rep-v02_1645216709324_2015.nc", sep="")) %>%
+  projectRaster(crs = projection) # need to work on projected data
+
+chla.2016 <- stack(paste("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Chlorophyll/",
+                         "dataset-oc-atl-chl-multi_cci-l4-chl_1km_monthly",
+                         "-rep-v02_1645216853136_2016.nc", sep="")) %>%
+  projectRaster(crs = projection)
+
+# Check how many layers there are in each to make sure it's ok
+nlayers(chla.2015) # 9 layers, months of Feb to Oct
+nlayers(chla.2016) # 10 layers, months of Feb to Nov
+
+# Plotted them to check too, it looks ok.
+```
+
+For each survey, mean monthly chla concentrations need to be averaged over the 3 months prior to the survey month:
+```{r chla averages, results='hide', fig.keep='all', out.width="90%"}
+chla.pam1 <- mean(chla.2015$X2015.02.01, chla.2015$X2015.03.01, chla.2015$X2015.04.01)
+chla.pam2 <- mean(chla.2015$X2015.05.01, chla.2015$X2015.06.01, chla.2015$X2015.07.01)
+chla.pam3 <- mean(chla.2015$X2015.06.01, chla.2015$X2015.07.01, chla.2015$X2015.08.01)
+chla.pam4 <- mean(chla.2016$X2016.02.01, chla.2016$X2016.03.01, chla.2016$X2016.04.01)
+chla.pam5 <- mean(chla.2016$X2016.03.01, chla.2016$X2016.04.01, chla.2016$X2016.05.01)
+chla.pam6 <- mean(chla.2016$X2016.07.01, chla.2016$X2016.08.01, chla.2016$X2016.09.01)
+
+# Put them in a list
+chla.averages <- list(chla.pam1, chla.pam2, chla.pam3, chla.pam4, chla.pam5, chla.pam6) 
+# rename list elements
+names(chla.averages) <- paste0("chla.pam", 1:6)
+
+# Plot the new layers
+par(mfrow = c(2,3))
+sapply(names(chla.averages), function(x) plot(chla.averages[[x]], zlim = c(0,10), main = x))
+```
+
+Now each of those layers need to be aggregated on the three different scales of interest. The starting one of 1x1km is too high, working with segments of 4km, such a high resolution is not needed.  
+The function `chla.agg.fun` is created, taking for argument the aggregation factor.
+
+```{r chla aggregation}
+# Factors of aggregation. Initial scale is 1km, so it's straightforward.
+agg.factor <- c(4, 10, 20)
+# dummy list
+mylist <- list()
+
+agg.fun <- function(aggregation){ # aggregation as argument
+  # data argument has an [[i]], because the function will be applied 
+  # from chla.pam1 to chla.pam6 in a loop
+  aggregate(chla.averages[[i]], fact = aggregation, fun = mean)
+}
+
+# Loop to call the function
+for (i in 1:length(chla.averages)){
+  # apply function agg.fun to all chla.averages (the iteration is in the
+  # function itself), take for argument aggregation = agg.factor
+  mylist[[i]] <- lapply(agg.factor, agg.fun)
+}
+
+# rename list elements
+names(mylist) <- paste0("chla.pam", 1:6)
+# rename the 3 nested elements in each chla.pam, corresponding to the 3 scales
+for (i in 1:length(chla.averages)){
+  names(mylist[[i]]) <- paste0("chla", agg.factor, "km")
+}
+```
+
+This results in **18 raster layers**: for each layer corresponding to a survey, 3 different scales.  
+Now the data from those raster layers need to be extracted for all the segments centroids along transects.  
+That's a bit tricky: for **each scale** (=column to be created), the corresponding sub-raster layer needs to be accessed, also **taking into account the survey ID** to reach the appropriate parent raster layer (the one corresponding to the survey). So both survey and scale need to be matched.  
+
+```{r chla extraction, warning=FALSE}
+# Define scales (need to be the same name as the columns for the loop)
+chla.scales <- c("chla4km", "chla10km", "chla20km")
+
+# Create the columns to be filled
+segs.PA$chla4km <- NA
+segs.PA$chla10km <- NA
+segs.PA$chla20km <- NA
+
+for(i in 1:length(chla.averages)){ # iterate over chla.averages (one per survey)
+  for(j in 1:length(chla.scales)){ # within each i, iterate over chla.scales (3 scales)
+    mylist[[i]][[j]] <- crop(mylist[[i]][[j]], area.box)
+    # in segs.PA, fill column j for survey i. 
+    # [[1]] to keep values only, as it was taking the geometry with it (sf object)
+    segs.PA[,chla.scales[j]][which(segs.PA$Survey == i),][[1]] <-
+      # take the raster [survey i][scale j] in mylist 
+      # need to convert to SpatRaster 
+      terra::extract(rast(mylist[[i]][[j]]), 
+              # extract values corresponding to points of survey i
+              # need to convert as SpatVector too
+              vect(segs.PA$geometry[which(segs.PA$Survey == i)]))[, -1]
+  } # finish iterating over j scales, go back up the loop and change value of i
+} # finish iterating over all i surveys
+
+# The loop gives warnings about providing 2 variables to replace 1, but it's not the case? 
+# I have the [[1]] to get rid of geometry. Verifications all went fine so I don't think the
+# warnings are a problem.
+
+# For verifications, make sure the value returned corresponds to what is in the table.
+# Replace i with survey id corresponding to the row (here 23)
+# Replace j with scale of interest
+# extract(rast(mylist[[1]][[1]]), vect(segs.PA$geometry[23]))
+```
+
+
+### Distance to SST front {-}
+Found front data on [Climate Copernicus](https://cds.climate.copernicus.eu/cdsapp#!/dataset/sis-fisheries-ocean-fronts?tab=overview).  
+
+__**Details on data**__  
+* __Dataset name__: Ocean fronts data for the Northwest European Shelf and Mediterranean Sea from 1991 up to 2100.  
+* __Primary data source__: NEMO-ERSEM (NEMO ocean model run on the Atlantic Margin Model (7 km) domain for the NW European Shelf coupled with the marine biogeochemical ERSEM model)  
+* __DOI__: [10.24381/cds.cc930b6e](10.24381/cds.cc930b6e)  
+* __Indicator__: sea surface temperature  
+* __Temporal resolution__: Monthly  
+* __Spatial resolution__: 0.06° x 0.06° (approx. 7 km)  
+
+```{r distfront data, message=FALSE, warning=FALSE, results='hide', fig.keep='all', out.width="80%"}
+# List all files containing "front_dist" and store their full paths in object
+distfront <- list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Ocean_fronts",
+                        pattern = "front_dist", full.names = TRUE) 
+
+# create a Raster Stack using these
+distfront <- stack(distfront) %>%
+  projectRaster(crs = projection)
+
+# Check how many layers there are in each to make sure it's ok
+nlayers(distfront) # 6 layers, 3 months per year, that's perfect
+# Check resolution
+res(distfront) # resolution is not squared as they say on the website: 0.11111 x 0.06667
+
+# Crop the raster layers to match the extend we are working with
+distfront <- crop(distfront, area.box)
+
+# Let's plot them
+plot(distfront, zlim = c(0,32))
+```
+
+These layers will be tested at spatial resolutions of 7 x 7 km (original resolution) and 20 x 20 km. Need to aggregate to 20 km. However, there is something odd: the actual resolution is squared but in the documentation it gives a squared grid. I don't think I will do anything about this anyway.
+
+```{r distfront aggregation, results='hide', fig.keep='all', out.width="80%"}
+# Factors of aggregation. Initial scale is 7 km, we want 20 km
+agg.factor <- 20/7
+
+# Aggregate directly on the RasterStack
+distfront20km <- aggregate(distfront, fact = agg.factor, fun = mean)
+#distfront20km <- crop(distfront20km, e)
+
+# Check resolution
+res(distfront20km) 
+# 0.33333 x 0.20001 - obviously aggregating on a larger scale 
+# makes the vertical/horizontal mismatch even more important...
+
+# Plot
+plot(distfront20km, zlim = c(0,32))
+```
+
+Now the distance to front is available at the initial scale of 7x7km `distfront` and the new 20x20km `distfront20km`, following the aggregation.  
+Time to extract the data and add it in the data table `segs.PA`.  
+
+To extract, the `RasterStack` object is un-stacked to have a list. As previously then, a loop is used to iterate over the different raster layers which correspond to the different surveys and values are extracted and appended to 2 different columns, one per scale.
+
+```{r extract distfront}
+distfront7km <- unstack(distfront) # unstack
+distfront20km <- unstack(distfront20km)
+
+# create the column first
+segs.PA$distfront7km <- NA
+segs.PA$distfront20km <- NA
+
+for (i in 1:length(distfront7km)){
+  # do it once for the 7km scale
+  segs.PA$distfront7km[which(segs.PA$Survey == i)] <- 
+    terra::extract(rast(distfront7km[[i]]), 
+            vect(segs.PA$geometry[which(segs.PA$Survey == i)]))[, -1]
+  # and again for the 20km scale
+  segs.PA$distfront20km[which(segs.PA$Survey == i)] <-
+    terra::extract(rast(distfront20km[[i]]),
+            vect(segs.PA$geometry[which(segs.PA$Survey == i)]))[, -1]
+}
+```
+
+### Frontal gradient magnitude {-}
+See details in the previous section for distance to front.  
+
+```{r frontstrength data, message=FALSE, warning=FALSE, results='hide', fig.keep='all', out.width="80%"}
+# List all files containing "front_strength" and store their full paths in object
+frontstrength <- list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Ocean_fronts",
+                        pattern = "front_strength", full.names = TRUE)
+frontstrength <- stack(frontstrength) %>%
+  projectRaster(crs = projection)
+nlayers(frontstrength) # 6 layers, 3 per year, all good
+frontstrength <- crop(frontstrength, area.box) # crop raster
+plot(frontstrength, zlim = c(0, 0.8)) # plot
+```
+
+Same as above, the layers need to be aggregated to 20 x 20 km. The same procedure is followed.
+
+```{r frontstrength aggregation, results='hide', fig.keep='all', out.width="80%"}
+agg.factor <- 20/7
+
+# Aggregate directly on the RasterStack
+frontstrength20km <- aggregate(frontstrength, fact = agg.factor, fun = mean)
+# Plot
+plot(frontstrength20km, zlim = c(0, 0.8))
+```
+
+Now the distance to front is available at the initial scale of 7x7km `frontstrength` and the new 20x20km `frontstrength20km`, following the aggregation.  
+Let's extract the data and add it in the data table `segs.PA`.  
+
+```{r extract frontstrength}
+frontstrength7km <- unstack(frontstrength) # unstack
+frontstrength20km <- unstack(frontstrength20km)
+
+# create the column first
+segs.PA$frontstrength7km <- NA
+segs.PA$frontstrength20km <- NA
+
+for (i in 1:length(frontstrength7km)){
+  # do it once for the 7km scale
+  segs.PA$frontstrength7km[which(segs.PA$Survey == i)] <- 
+    terra::extract(rast(frontstrength7km[[i]]), 
+            vect(segs.PA$geometry[which(segs.PA$Survey == i)]))[, -1]
+  # and again for the 20km scale
+  segs.PA$frontstrength20km[which(segs.PA$Survey == i)] <-
+    terra::extract(rast(frontstrength20km[[i]]),
+            vect(segs.PA$geometry[which(segs.PA$Survey == i)]))[, -1]
+}
+```
+
+### Sea surface temperature {-}
+
+Following advice from the Marine Institute, I accessed data from the Group for High Resolution Sea Surface Temperature (GHRSST) v4.1 global dataset (JPL MUR MEaSUREs Project, 2015). The GHRSST Multiscale Ultra-high Resolution (MUR) SST data were accessed from NOAA CoastWatch program website (http://coastwatch.pfeg.noaa.gov/index.html, accessed on 22 February 2022).
+
+#### Weekly SST
+__**Data accessed details**__:  
+
+* __Dataset__: GHRSST Level 4 MUR Global Foundation Sea Surface Temperature Analysis (v4.1)  
+* __ERDDAP ID__: [jplMURSST41](https://coastwatch.pfeg.noaa.gov/erddap/griddap/jplMURSST41.html)  
+* __DOI__: [https://doi.org/10.5067/GHGMR-4FJ04](https://doi.org/10.5067/GHGMR-4FJ04)  
+* __Temporal resolution__: Daily  
+* __Spatial resolution__: 0.01° x 0.01°  
+* __Citation__: JPL MUR MEaSUREs Project. 2015. GHRSST Level 4 MUR Global Foundation Sea Surface Temperature Analysis. Ver. 4.1. PO.DAAC, CA, USA. Dataset accessed [22-02-2022] at https://doi.org/10.5067/GHGMR-4FJ04  
+
+Data was downloaded for the days covering each survey (= 6 distinct `.nc` files). The resolution of those layers is daily, but what I want here is to work with the average across the days in each survey (5-8 days depending on the survey, but it's ok I'll call that weekly average).  
+
+```{r dailysst data, message=FALSE, warning=FALSE, results='hide', fig.keep='all', out.width="70%"}
+# List all files containing "front_dist" and store their full paths in object
+weeksst <- list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/SST",
+                        pattern = "MURSST_Daily", full.names = TRUE)
+
+# dummy list
+weeksst.list <- list()
+# create raster stacks of each .nc file (stack all the days in each survey)
+for (i in 1:length(weeksst)){
+  weeksst.list[[i]] <- stack(weeksst[i]) %>%
+  projectRaster(crs = projection)
+}
+names(weeksst.list) <- paste0("sst.pam", 1:6) # rename the list elements
+#sapply(names(weeksst.list), function(x) plot(weeksst.list[[x]], main = x))
+```
+
+I'm not going to plot all the layers in the Markdown, but some observations:  
+* **PAM1 to PAM3**, the SST across the days is quite stable with a clear north-south gradient. Temperatures range from approx. 8-14°C during PAM 1, 12-18°C during PAM2/PAM3.  
+* **PAM4**, the first 3 days, again this stable gradient but the cold waters moves quickly up north, leaving same temperatures throughout the area with the exception of 2 local zones (eddy?) of cold water arriving from the south. Temperatures range: approx. 8-14°C.   
+* **PAM5** much less homogeneous with some patches of colder water (actually along the shelf edge overall), moving throughout the days. But overall compared to the previous surveys, warmer temperatures. Temperatures range: approx. 10-17°C.  
+* **PAM6**, the gradient is back overall, quite stable throughout the days. Again overall, warmer temperatures.Temperatures range: approx. 11-18°C.  
+
+These are daily averages which are still good to have a look at. But they need to be averaged. This is done on each `Raster Stack` object within the list `weeksst.list` using the `calc` function.
+
+```{r weeklysst data, message=FALSE, warning=FALSE, results='hide', fig.keep='all', out.width="70%"}
+# create raster stacks of each .nc file (stack all the days in each survey)
+for (i in 1:length(weeksst)){
+  weeksst.list[[i]] <- calc(weeksst.list[[i]], fun = mean)
+}
+names(weeksst.list) <- paste0("weekly.sst.pam", 1:6) # rename the list elements
+
+par(mfrow = c(2,3))
+sapply(names(weeksst.list), function(x) plot(weeksst.list[[x]], zlim = c(8,18), main = x))
+```
+
+The next step is to aggregate to coarser resolutions. The original data has a scale of 0.01° x 0.01° (approx. 1 km), so as for the chla, it will be aggregated to 4 x 4 km, 10 x 10 km, 20 x 20 km. Same as for chla data, so the custom `agg.fun` function can be recycled and applied to the different layers in `weeksst.list`. 
+
+```{r weeksst aggregation}
+agg.factor <- c(4, 10, 20)
+
+weeksst.all <- list()
+agg.fun <- function(aggregation){ 
+  aggregate(weeksst.list[[i]], fact = aggregation, fun = mean)
+}
+
+# Loop to call the function
+for (i in 1:length(weeksst.list)){
+  weeksst.all[[i]] <- lapply(agg.factor, agg.fun)
+}
+
+# rename list elements
+names(weeksst.all) <- paste0("weeksst.pam", 1:6)
+# rename the 3 nested elements in each weeksst.pam, corresponding to the 3 scales
+for (i in 1:length(weeksst.list)){
+  names(weeksst.all[[i]]) <- paste0("week.sst", agg.factor, "km")
+}
+```
+
+The aggregation completed, `weeksst.all` contains 18 raster layers with weekly SST data averaged over 3 different scales for each survey.  
+The data from these layers now need to be extracted and added to the `segs.PA` data table. Again, recycle the chunk written for chla. 
+
+```{r weeksst extraction, warning=FALSE}
+weeksst.scales <- c("weeksst4km", "weeksst10km", "weeksst20km")
+
+segs.PA$weeksst4km <- NA
+segs.PA$weeksst10km <- NA
+segs.PA$weeksst20km <- NA
+
+for(i in 1:length(weeksst.list)){
+  for(j in 1:length(weeksst.scales)){
+    weeksst.all[[i]][[j]] <- crop(weeksst.all[[i]][[j]], area.box)
+
+    segs.PA[,weeksst.scales[j]][which(segs.PA$Survey == i),][[1]] <-
+      terra::extract(rast(weeksst.all[[i]][[j]]),
+              vect(segs.PA$geometry[which(segs.PA$Survey == i)]))[, -1]
+  }
+}
+# where `weeksst.all` is the list with data for all surveys at all scales
+```
+
+Done!
+
+#### Monthly SST
+
+Same dataset, but processed monthly.  
+**ERDDAP ID**: [jplMURSST41mday](https://coastwatch.pfeg.noaa.gov/erddap/griddap/jplMURSST41mday.html)  
+
+Data was downloaded for each survey month. 
+
+```{r monthlysst data, message=FALSE, warning=FALSE, results='hide', fig.keep='all', out.width="70%"}
+# List all files containing "front_dist" and store their full paths in object
+monthsst <- list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/SST",
+                        pattern = "MURSST_Monthly", full.names = TRUE)
+monthsst <- stack(monthsst) %>% projectRaster(crs = projection)
+names(monthsst) <- paste0("sst.pam", 1:6)
+plot(monthsst, zlim = c(8.5, 18))
+```
+
+Again, aggregate to 4 x 4 km, 10 x 10 km, 20 x 20 km.
+
+```{r monthsst aggregation}
+agg.factor <- c(4, 10, 20)
+
+agg.fun <- function(aggregation){ 
+  aggregate(monthsst, fact = aggregation, fun = mean)
+}
+
+# all surveys stacked, so we need to apply the different scales only
+monthsst.all <- lapply(agg.factor, agg.fun)
+```
+
+Because the surveys were stacked here but it works the same as a nested list.  
+The `monthsst.all` object is a list of 3 elements, corresponding to each scale of interest. In each element there is a `Raster Brick` object with the raster layers for each survey.
+
+```{r monthsst extraction, warning=FALSE}
+monthsst.scales <- c("monthsst4km", "monthsst10km", "monthsst20km")
+names(monthsst.all) <- monthsst.scales # rename the list elements
+segs.PA$monthsst4km <- NA
+segs.PA$monthsst10km <- NA
+segs.PA$monthsst20km <- NA
+
+# same principle for the loop as a previous one, but careful
+# it's a list of SCALES (raster bricks) and then the SURVEYS are nested (elements of the bricks)
+# So the loop used before is just 'inverted'
+for (scale in 1:length(monthsst.scales)){
+  
+  monthsst.all[[scale]] <- crop(monthsst.all[[scale]], area.box)
+
+  for (survey in 1:6){
+    segs.PA[,monthsst.scales[scale]][which(segs.PA$Survey == survey),][[1]] <-
+      terra::extract(rast(monthsst.all[[scale]][[survey]]),
+              vect(segs.PA$geometry[which(segs.PA$Survey == survey)]))[, -1]
+  }
+}
+```
+
+Done! Values are very similar between weekly and monthly averages so I don't expect the AIC between the two temporal scales to differ so much, but let's see later in the scale selection.
+
+### SST deviation from monthly median {-}
+
+The first here consists of calculating the **monthly median** value of SST for each cell.  
+To do this, the **daily** values of SST for the entire survey months are needed. So they are re-downloaded from ERDDAP (for SST I had downloaded data only for each survey week).
+
+Compute the median in each cell directly on each `RasterStack`, using the function `calc`. This operation will return a single `RasterLayer` (one per survey).
+
+```{r SST median, results='hide', fig.keep='all', out.width="80%"}
+fullmonthsst <- list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/SST",
+                        pattern = "WholeMonth", full.names = TRUE)
+
+sst.median <- list()
+for (survey in 1:length(fullmonthsst)){
+  sst.median[[survey]] <- calc(
+    projectRaster(stack(fullmonthsst[[survey]]), crs=projection), median)
+}
+names(sst.median) <- paste0("sst.pam", 1:6)
+sst.median <- stack(sst.median) # stack everything
+plot(sst.median, zlim = c(8,18))
+```
+
+Then, those need to be aggregated on the different spatial scales of interest (4 x 4 km, 10 x 10 km, 20 x 20 km).
+
+```{r sst.median aggregation}
+agg.fun <- function(aggregation){ 
+  aggregate(sst.median, fact = aggregation, fun = mean)
+}
+
+# all surveys stacked, so we need to apply the different scales only
+sst.median.all <- lapply(agg.factor, agg.fun)
+sst.median.all <- lapply(sst.median.all, crop, area.box)
+names(sst.median.all) <- c("4km", "10km", "20km")
+```
+
+Computing the deviation of SST from the monthly median consists of a simple substraction between all layers in `sst.median.all` and `monthsst.all`. A loop is used for that, to iterate over each of the 3 `RasterBricks` (one per scale) in the lists.
+
+```{r deviation SST}
+dev.sst <- list()
+for (scale in 1:3){
+  dev.sst[[scale]] <- sst.median.all[[scale]] - monthsst.all[[scale]]
+}
+scalenames <- c("dev.sst4km", "dev.sst10km", "dev.sst20km")
+names(dev.sst) <- scalenames
+```
+
+We can now extract the values:
+
+```{r dev.sst extraction, warning=FALSE}
+# col names need to be the same as list elements names
+segs.PA$dev.sst4km <- NA
+segs.PA$dev.sst10km <- NA
+segs.PA$dev.sst20km <- NA
+
+for (scale in 1:length(scalenames)){
+  for (survey in 1:6){
+    segs.PA[,scalenames[scale]][which(segs.PA$Survey == survey),][[1]] <-
+      terra::extract(rast(dev.sst[[scale]][[survey]]),
+              vect(segs.PA$geometry[which(segs.PA$Survey == survey)]))[, -1]
+  }
+}
+```
+
+### Standard deviation of SST {-}
+The variation in SST across a window of five cells is generated now.
+As for generating the rugosity variable, the function `focal` from `terra` package is used, specifying `fun = "sd"`. A window of five cells is specified for the calculation with the argument `w = 5`.
+
+It won’t run with the current structure of the `monthsst.all` and `weeksst.all` objects. Need to break the structure completely first and convert all the layers from `Raster` format to `SpatRaster` format for compatibility with `terra`.
+
+```{r breaking structure}
+# straightforward for weeksst.allscales as it's a list
+weeksst <- unlist(weeksst.all, use.names = TRUE) 
+
+# for monthsst (which has nested RasterBricks), need to first unstack them
+monthsst <- list()
+for (i in 1:length(monthsst.all)){
+  monthsst[[i]] <- unstack(monthsst.all[[i]])
+}
+monthsst <- unlist(monthsst, use.names = TRUE) # then unlist the nested elements
+
+# Convert to SpatRaster layers
+weeksst <- lapply(weeksst, rast)
+monthsst <- lapply(monthsst, rast)
+```
+
+The sdSST can now be computed:
+
+```{r compute sdSST}
+sd.weeksst <- list()
+sd.monthsst <- list()
+for (i in 1:length(weeksst)){
+  sd.weeksst[[i]] <- focal(weeksst[[i]], w = 5, fun = sd)
+  sd.monthsst[[i]] <- focal(monthsst[[i]], w = 5, fun = sd)
+}
+```
+
+`sd.weeksst` and `sd.monthsst` are almost ready, but to ease the extraction step, let’s rebuild a decent structure in those lists:
+
+```{r rebuild structure}
+# need to be very careful here because the structure of both objects is opposite 
+# and the names are gone
+# Start with sd.weeksst, which has surveys WITHIN scales
+sd.weeksst <- split(sd.weeksst, paste0("sd.weeksst", rep(c(4,10,20), 6), "km"))
+for (scale in 1:3){
+  names(sd.weeksst[[scale]]) <- names(monthsst.all$monthsst4km) 
+}
+# reorder that list because the scales are messy
+sd.weeksst.scales <- c("sd.weeksst4km", "sd.weeksst10km", "sd.weeksst20km")
+sd.weeksst <- sd.weeksst[sd.weeksst.scales]
+
+# sd.monthsst has scales WITHIN surveys
+sd.monthsst.scales <- c("sd.monthsst4km", "sd.monthsst10km", "sd.monthsst20km")
+sd.monthsst <- split(sd.monthsst, paste0("pam", rep(seq(1:6), 3)))
+for (survey in 1:6){
+  names(sd.monthsst[[survey]]) <- sd.monthsst.scales
+}
+```
+
+Let’s extract and append to the `segs.PA` table:
+
+```{r extract sdSST}
+# For weekly composite first
+segs.PA$sd.weeksst4km <- NA
+segs.PA$sd.weeksst10km <- NA
+segs.PA$sd.weeksst20km <- NA
+
+# sd.weeksst, which has surveys WITHIN scales
+for (scale in 1:length(sd.weeksst.scales)){
+  for (survey in 1:6){
+    segs.PA[,sd.weeksst.scales[scale]][which(segs.PA$Survey == survey),][[1]] <-
+      terra::extract(sd.weeksst[[scale]][[survey]],
+              vect(segs.PA$geometry[which(segs.PA$Survey == survey)]))[, -1]
+  }
+}
+
+# and for monthly composite
+segs.PA$sd.monthsst4km <- NA
+segs.PA$sd.monthsst10km <- NA
+segs.PA$sd.monthsst20km <- NA
+
+# sd.monthsst has scales WITHIN surveys
+for(survey in 1:6){
+  for(scale in 1:length(sd.monthsst.scales)){
+    segs.PA[,sd.monthsst.scales[scale]][which(segs.PA$Survey == survey),][[1]] <-
+      terra::extract(sd.monthsst[[survey]][[scale]],
+              vect(segs.PA$geometry[which(segs.PA$Survey == survey)]))[, -1]
+  }
+}
+```
+
+An observation: for `sd.monthsst` and `sd.weeksst`, the values across the different spatial scales are this time, very much different for the same raster cell.
+
+### Relative SST {-}
+
+Decided at the last minute to add this, because the results of the models (which retained the SST) revealed a strange peak that I realised to be a bias due to the fact that the available temperatures are very different in May compared to the other zones. That probably explains that peak, so I want to try and see what comes up if I add a SST indicator which is relative to the temperature throughout the area.
+
+The relSST is the difference between SST at a geographic position and the mean SST over the entire region. For the *region* I need to work only within my survey area, so the first step is to start from my `weeksst.all` and `monthsst.all` Raster stacks and crop them.
+
+```{r weeksst crop, results='hide', fig.keep='all', out.width="80%"}
+# Survey boxes
+northbox <- st_read("F:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Shapefiles/NorthBox.shp")
+southbox <- st_read("F:/PhD/ObSERVE_MASTER/ObSERVE_PAM/Shapefiles/SouthBox.shp")
+st_crs(northbox) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs" # define crs
+st_crs(southbox) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+northbox <- st_transform(northbox, 
+            crs ="+proj=utm +zone=29 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+southbox <- st_transform(southbox, 
+            crs ="+proj=utm +zone=29 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+
+# Merge them
+area <- st_union(northbox, southbox)
+
+# Create a polygon encompassing both zones, with a little buffer around
+pred.zone <- st_simplify(st_buffer(area, dist = 20000), dTolerance = 7000)
+
+# Let's crop
+# duplicate source list to create one of same structure
+weeksst.all.crop <- weeksst.all 
+
+for (i in 1:length(weeksst.all)){
+  for (j in 1:3) {
+      weeksst.all.crop[[i]][[j]] <- weeksst.all[[i]][[j]] %>% mask(mask = pred.zone) %>% crop(y = extent(pred.zone))
+  }
+}
+
+# plot just one to check
+plot(weeksst.all.crop$weeksst.pam5$week.sst4km)
+```
+
+We now do the same on the monthly averages:
+
+```{r monthsst crop, results='hide', fig.keep='all', out.width="80%"}
+monthsst.all.crop <- monthsst.all 
+
+# reverse structure here so be careful
+for (i in 1:length(monthsst.all)){
+      monthsst.all.crop[[i]] <- monthsst.all[[i]] %>% mask(mask = pred.zone) %>% crop(y = extent(pred.zone))
+}
+
+# plot just one to check
+plot(monthsst.all.crop$monthsst4km$sst.pam5)
+```
+
+First step now into computing the relSST is to calculate an average value of SST over the entire area for each survey. To do this the `cellStats` function from package `raster` is used. All those averages across the area are stored in lists: `av.area.week` (weekly averages) and `av.area.month` (monthly averages).
+
+```{r area averages}
+av.area.week <- weeksst.all # again duplicate to have the same structure
+for (i in 1:length(weeksst.all)) { # iterate on surveys
+  for (j in 1:3) { # in each survey, iterate on scales
+    av.area.week[[i]][[j]] <- cellStats(weeksst.all.crop[[i]][[j]], stat = "mean")
+  }
+}
+
+av.area.month <- monthsst.all
+for (i in 1:length(monthsst.all)){
+  av.area.month[[i]] <- cellStats(monthsst.all.crop[[i]], stat = 'mean')
+}
+
+# Have a look at the monthly averages
+print(av.area.month)
+```
+
+Now that we have those, we need to subtract them from each cell of the corresponding SST raster to get the relative SST.
+First we do it on the weekly composites:
+
+```{r relSST week, results='hide', fig.keep='all', out.width="80%"}
+relSST.week <- weeksst.all.crop
+for (i in 1:length(weeksst.all.crop)) {
+  for (j in 1:3) {
+    relSST.week[[i]][[j]] <- weeksst.all.crop[[i]][[j]] - av.area.week[[i]][[j]]
+  }
+}
+# plot all surveys ( [[x]] ) on the 4km scale ( [[1]] ) 
+par(mfrow = c(2,3))
+sapply(names(relSST.week), function(x) plot(relSST.week[[x]][[1]], zlim = c(-3,3), main = paste0("relative.", x)))
+```
+
+And now on the monthly composites:
+
+```{r relSST month, results='hide', fig.keep='all', out.width="80%"}
+relSST.month <- monthsst.all.crop
+for (i in 1:length(monthsst.all.crop)) {
+    relSST.month[[i]] <- monthsst.all.crop[[i]] - av.area.month[[i]]
+}
+# plot all surveys on the 4km scale ( [[1]] ) 
+plot(relSST.month[[1]], zlim = c(-2,2), main = paste0("relative.", names(relSST.month[[1]])))
+```
+
+Extract to the table:
+
+```{r extract relSST, results='hide'}
+segs.PA$relsst.week4km <- NA
+segs.PA$relsst.week10km <- NA
+segs.PA$relsst.week20km <- NA
+
+# relSST.week, which has scales WITHIN surveys
+rel.weeksst.scales <- c("relsst.week4km", "relsst.week10km", "relsst.week20km")
+
+for (survey in 1:6){
+  for (scale in 1:3){
+    segs.PA[, rel.weeksst.scales[scale]][which(segs.PA$Survey == survey),][[1]] <-
+      terra::extract(rast(relSST.week[[survey]][[scale]]),
+              vect(segs.PA$geometry[which(segs.PA$Survey == survey)]))[, -1]
+  }
+}
+
+# and for monthly composite
+segs.PA$relsst.month4km <- NA
+segs.PA$relsst.month10km <- NA
+segs.PA$relsst.month20km <- NA
+
+rel.weeksst.scales <- c("relsst.month4km", "relsst.month10km", "relsst.month20km")
+
+# relSST.week has surveys WITHIN scales
+for(scale in 1:3){
+  for(survey in 1:6){
+    segs.PA[,rel.weeksst.scales[scale]][which(segs.PA$Survey == survey),][[1]] <-
+      terra::extract(rast(relSST.month[[scale]][[survey]]),
+              vect(segs.PA$geometry[which(segs.PA$Survey == survey)]))[, -1]
+  }
+}
+```
+
+
+**Note**: I've added this variable much later, and it turns out to be significant so I'm gonna need layers for predictions. Since I'm in here and everything is loaded in the environment, I'm directly exporting from here a `RasterStack` with the values of relSST across the area for each survey (on the scale that matters of course: monthly, 4km). So in the `03_Modelling.Rmd` I'll simply have to import it instead of-regenerating. The chunk is hidden but can be found in the source code. I'm also doing chla. Both saved in `F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Chlorophyll` and `F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/SST` folders.
+
+```{r relsst preds, echo=FALSE, eval=FALSE}
+# get extra SST data for oct2015/sep2016
+extra.sst <- list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/SST",
+                        pattern = "PREDICTIONS", full.names = TRUE) %>%
+  stack() %>% projectRaster(crs = projection) %>% aggregate(4) %>% 
+  # stack, project and aggregate to 4km
+  mask(mask = pred.zone) %>% crop(y = extent(pred.zone)) # crop
+extra.sst.av <- cellStats(extra.sst, stat = 'mean') # get average over area
+
+relSST.oct2015 <- extra.sst[[1]] - extra.sst.av[1]
+relSST.sep2016 <- extra.sst[[2]] - extra.sst.av[2]
+
+# need to keep only the layers for scale 4km from the monthly composites
+# stack them with those newly created layers we will also need
+relSST.month.preds <- stack(relSST.month$monthsst4km, relSST.oct2015, relSST.sep2016)
+
+writeRaster(relSST.month.preds, "F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/SST/relSST_month_forpreds.tif")
+
+# move on to CHLA
+# need to get the 3-mo average for extra months of oct2015 and sep2016
+chla.oct2015 <- mean(chla.2015$X2015.07.01, chla.2015$X2015.08.01, chla.2015$X2015.09.01)
+chla.sep2016 <- mean(chla.2016$X2016.06.01, chla.2016$X2016.07.01, chla.2016$X2016.08.01)
+
+# need to be aggregated to 4km
+chla.oct2015 <- aggregate(chla.oct2015, fact = 4) %>%
+  mask(mask = pred.zone) %>% crop(y = extent(pred.zone))
+
+chla.sep2016 <- aggregate(chla.sep2016, fact = 4) %>%
+  mask(mask = pred.zone) %>% crop(y = extent(pred.zone))
+
+# need to resample because I can't fall on the exact same resolution
+chla.oct2015 <- resample(chla.oct2015, relSST.oct2015)
+chla.sep2016 <- resample(chla.sep2016, relSST.oct2015)
+
+# those computed just above need to be taken for 4km
+chla.preds <- sapply(mylist, "[[", 1) %>%
+  stack() %>% mask(mask = pred.zone) %>% crop(y = extent(pred.zone)) %>%
+  resample(relSST.oct2015)
+chla.preds <- stack(chla.preds, chla.oct2015, chla.sep2016)
+
+writeRaster(chla.preds, "F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Chlorophyll/chla.preds.tif")
+```
+
+### Sea level anomaly {-}
+
+Some documentation on altimetry products which could come in handy:  
+* [SLA vs ADT](https://www.aviso.altimetry.fr/en/data/data-access/las-live-access-server/lively-data/2004/june-15-2004-sla-vs-adt.html) - with SLA turbulency in current and eddies can be seen better, with ADT it's more general ocean dynamics.  
+* [SLA vs ADT for eddies detection](https://doi.org/10.1016/j.asr.2020.03.039): with SLA, more individual eddies and trajectories can be detected.  
+* [Altimetry heights](https://duacs.cls.fr/faq/what-are-the-product-specification/different-sea-surface-heights-used-in-altimetry/)  
+* A cool example of a [study from Chizé](https://duacs.cls.fr/studies-applications/elephant-seals-turn-around-eddies/) on a tagged elephant seal - SLA map overlaid with trajectory shows the animal turned around an eddy.  
+* [Cyclonic vs anticyclonic](http://tornado.sfsu.edu/geosciences/classes/m415_715/Monteverdi/Satellite/Oceanography/eddy.htm) eddies: in northern hemisphere, **counterclockwise** rotation = **cyclonic** eddy, the center of which is cooler and lower in height (by a few tens of centimeters) than the outer lying waters (= cold-core eddy) - upwelling. **Clockwise** rotation = **anticyclonic**, warmer and higher center (=warm-core eddy) - downwelling.
+
+The scale of 0.25° x 0.25° of the Copernicus Climate product is not going to be too problematic, can still pick up very well what's going on. Also, even though the resolution is higher, the alternative product from [CMEMS](https://doi.org/10.48670/moi-00059) has SSH above the geoid (= ADT). But I'd rather take SLA, plus when mapping the latter there seems to be something odd about it with such little variation in my area. So I take:
+
+**Product details**:  
+* __Name__: [Sea level anomaly](https://cds.climate.copernicus.eu/cdsapp#!/dataset/satellite-sea-level-global?tab=overview), i.e. sea surface height above the mean sea surface in a twenty-year reference period (1993–2012).  
+* Obtained from the Copernicus Climate Data Store (CDS), operated by the European Centre for Medium Range Weather Forecasting on behalf of the European Union [https://cds.cli mate.copernicus.eu/](https://cds.climate.copernicus.eu/).  
+* __Spatial scale__: 0.25° x 0.25°  
+* __Temporal scale__: daily
+
+Product downloaded for each survey day (one file per day is generated by the website).
+
+```{r sla data}
+# get the files, differentiate the files corresponding to each survey
+patterns <- c("201505", "201508", "201509", "201605", "201606", "201610") # do that based on YYYYMM
+
+# dummy lists
+files <- list()
+stacks <- list()
+
+## Need to absolutely rename the layers within the stacks as well to keep the dates, 
+## or I won't be able to match them with the dates in the table
+
+# Before that, I need to first add a letter before the dates in the table, 
+# because he won't name layers with a string starting with a number
+segs.PA$TempDate <- paste0("D", segs.PA$UTCDate) 
+dates <- list() # to store the dates within each survey
+
+for (survey in 1:length(patterns)){
+  # list the files, separating different surveys
+  files[[survey]] <- list.files("F:/PhD/Ch4_Modelling_SPW_PAM/01_Data/Rasters/Sea_level_anomaly/", 
+                           pattern = patterns[survey], full.names = TRUE)
+# create 6 stacks (one per survey), containing all daily files, select variable SLA
+# because can't download only one variable on Climate Copernicus
+  stacks[[survey]] <- stack(files[[survey]], varname = "sla") %>%
+    # change the CRS to the one used for all raster layers so far
+    projectRaster(crs = "+proj=utm +zone=29 +ellps=WGS84 +datum=WGS84 +units=m +no_defs") %>%
+    # crop to the extent used so far (Climate Copernicus does not allow to subset an area)
+    crop(area.box)
+
+# using levels(as.factor()) re-orders the dates (for some surveys it's in reverse chronological order)
+  dates[[survey]] <- levels(as.factor(segs.PA$TempDate[which(segs.PA$Survey == survey)]))
+  names(stacks[[survey]]) <- dates[[survey]]
+}
+
+names(stacks) <- paste0("pam", 1:6) # rename the different stacks
+```
+
+Ready for extraction:
+
+```{r sla extraction}
+segs.PA$SLA <- NA
+
+for (survey in 1:length(patterns)){
+  for (day in 1:length(dates[[survey]])){
+    segs.PA$SLA[which(segs.PA$Survey == survey & segs.PA$TempDate == dates[[survey]][[day]])] <-
+terra::extract(rast(stacks[[survey]][[day]]), 
+      vect(segs.PA$geometry[which(segs.PA$Survey == survey & segs.PA$TempDate == dates[[survey]][day])]))[, -1]
+  }
+}
+segs.PA$TempDate <- NULL # remove TempDate column
+```
+
+## {-}
+
+## Year and season
+
+Here I want to also add the year as a factor, to test it just in case. I will use `case_when` for that and assign 2015 or 2016 when applicable. For the season we use numeric values because character strings are not valid for BART.
+
+```{r yearseason, results='hide'}
+segs.PA$Year <- case_when(
+  segs.PA$Survey == 1 | segs.PA$Survey == 2 | segs.PA$Survey == 3 ~ 2015,
+  segs.PA$Survey == 4 | segs.PA$Survey == 5 | segs.PA$Survey == 6 ~ 2016,
+  TRUE ~ as.numeric(NA_character_))
+
+segs.PA$Season <- case_when(
+  segs.PA$Survey == 1 | segs.PA$Survey == 4 ~ 1,
+  segs.PA$Survey == 2 | segs.PA$Survey == 5 ~ 2,
+  segs.PA$Survey == 3 | segs.PA$Survey == 6 ~ 3,
+  TRUE ~ as.numeric(NA_character_))
+
+segs.PA$Season <- as.factor(segs.PA$Season)
+segs.PA$Year <- as.factor(segs.PA$Year)
+```
+
+
+**Finally** all the variables are in! Let's export that big table both as a `.RDS`.
+
+```{r export segs.PA}
+# Just quickly need to interpolate the few (12) NAs contained in the chla4km column
+segs.PA <- segs.PA %>%
+        mutate(chla4km = na.approx(chla4km))
+saveRDS(segs.PA, file="../01_Data/SPW_PAM_allcovariates.rds")
+write.csv(segs.PA, file = "../01_Data/SPW_PAM_allcovariates.csv")
+```
